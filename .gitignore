@@ -1,0 +1,10 @@
+# Local dependencies and build output
+node_modules/
+target/
+
+# Test screenshots, exports and diagnostics produced by test runs
+comparison/tests/browser-results/
+
+# Local operating-system and tool files
+.DS_Store
+*.log
