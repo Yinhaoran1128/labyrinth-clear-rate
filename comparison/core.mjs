@@ -11,7 +11,7 @@ export const MONSTERS = [
 export function validateSettings({level, trials, seed=null}) {
   level=Number(level); trials=Number(trials);
   if (!Number.isSafeInteger(level)||level<1||level>10000) throw new Error('怪物等级必须是 1～10000 的整数');
-  if (!Number.isSafeInteger(trials)||trials<1||trials>2000) throw new Error('模拟次数必须是 1～2000 的整数');
+  if (!Number.isSafeInteger(trials)||trials<1||trials>3000) throw new Error('模拟次数必须是 1～3000 的整数');
   if (seed!==null) {
     seed=Number(seed);
     if (!Number.isSafeInteger(seed)||seed<0||seed>0xffffffff) throw new Error('种子必须是 0～4294967295 的整数');
@@ -52,7 +52,7 @@ export function makeRustScenario(game, params) {
   return sc;
 }
 
-export function summarizeResult(raw) {
+export function summarizeResult(raw, timeBasis = 'last-success') {
   const stats=raw.labyrinthStats;
   const successes=stats?stats.successes:raw.successes;
   // Original 1.5.14 counts actual player deaths even when thorns also kill the monster.
@@ -66,9 +66,14 @@ export function summarizeResult(raw) {
   const failedByTimeout=stats?Math.max(0,stats.completedTrials-successes-failedByDeath):(raw.failedByTimeout||0);
   const trials=stats?Math.max(1,successes+failedByDeath+failedByTimeout):raw.trials;
   const completedSpentSeconds=stats?stats.completedSpentNs/1e9:null;
-  const totalSpentSeconds=stats
+  // Keep the original last-success clock for the comparison tool. Calculators
+  // explicitly use completed time, including trailing failed encounters.
+  const totalSpentSeconds=timeBasis === 'completed' ? completedSpentSeconds : stats
     ? (raw.lastEncounterFinishTime>0?raw.lastEncounterFinishTime/1e9:completedSpentSeconds)
     : raw.totalSpentSeconds;
+  if(timeBasis === 'completed' && (totalSpentSeconds === null || !Number.isFinite(totalSpentSeconds) || totalSpentSeconds < 0)) {
+    throw new Error('缺少有效的已完成对局累计耗时');
+  }
   return {
     trials,successes,failures:Math.max(0,trials-successes),
     failedByDeath,failedByTimeout,completedTrials:stats?.completedTrials??null,

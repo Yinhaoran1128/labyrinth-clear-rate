@@ -21,6 +21,7 @@ export async function buildCalculators() {
   const recommendation=await compile('recommendation.mjs',{globalName:'CombatRecommendation'});
   const production=await compile('production-chart.mjs',{globalName:'ProductionChart'});
   const chart=await compile('recommendation-chart.mjs',{globalName:'RecommendationChart'});
+  const controls=await compile('automation-controls.mjs',{globalName:'TimeControls'});
   const stock=await stockEngine();
   const data=packed(JSON.stringify({fallbackData:fixtureGame().$e,originalMaps:stock.maps}));
   const wasm=fs.readFileSync(path.join(here,'../comparison/assets/mwi_engine.wasm'));
@@ -33,14 +34,15 @@ export async function buildCalculators() {
       .replace(/\/\/ @name(?:\:zh-CN)?\s+迷宫胜率计算器/g,match=>match.replace('迷宫胜率计算器',`迷宫胜率计算器（${label}）`))
       .replace(/\/\/ @name:en[^\n]+/,'// @name:en      Labyrinth Calculator '+(mode==='embedded'?'Rust Embedded':'Rust Remote'))
       .replace(/\/\/ @namespace[^\n]+/,`// @namespace    mwi-labyrinth-calculator-rust-${mode}`)
-      .replace(/\/\/ @version[^\n]+/,'// @version      1.6.4')
+      .replace(/\/\/ @version[^\n]+/,'// @version      1.6.7')
       .replace(/\/\/ @author[^\n]+/,'// @author       dakonglong; wow121; Yinhr (Rust adapter)')
       .replace(/\/\/ @description:zh-CN[^\n]+/,`// @description:zh-CN  原版迷宫界面与配装逻辑；${label}计算战斗胜率和预计通关耗时。`)
       .replace(/^\/\/ @(?:downloadURL|updateURL)[^\n]+\n/gm,'')
-      .replace(/window\.__MWI_LAB_CLEAR_RATE_OVERLAY_VERSION__ = "[^"]+";/,`window.__MWI_LAB_CLEAR_RATE_OVERLAY_VERSION__ = "1.6.4-rust-${mode}";`)
+      .replace(/window\.__MWI_LAB_CLEAR_RATE_OVERLAY_VERSION__ = "[^"]+";/,`window.__MWI_LAB_CLEAR_RATE_OVERLAY_VERSION__ = "1.6.7-rust-${mode}";`)
+      .replace('const MAX_COMBAT_SIM_TRIALS = 2000;', 'const MAX_COMBAT_SIM_TRIALS = 3000;')
       .replace(/const COMBAT_MODEL_SIGNATURE = "[^"]+";/,`const COMBAT_MODEL_SIGNATURE = "${model}";`);
     const insert=source.indexOf('    const ROOM_DURATION_SECONDS =');
-    source=source.slice(0,insert)+`\n${runtime}\n${recommendation}\n${production}\n${chart}\n    const rustCalculator = CalculatorRuntime.create(${JSON.stringify(assets)});\n`+source.slice(insert);
+    source=source.slice(0,insert)+`\n${runtime}\n${recommendation}\n${production}\n${chart}\n${controls}\n    let automationRecommendBasis = 'winRate';\n    const rustCalculator = CalculatorRuntime.create(${JSON.stringify(assets)});\n`+source.slice(insert);
     // Apply the new search only to combat; the pinned original remains unchanged.
     source=source.replace('    async function findAutomationRecommendedLevelDelta(params) {',`
     async function findAutomationRecommendedLevelDelta(params) {
@@ -48,11 +50,19 @@ export async function buildCalculators() {
             return CombatRecommendation.findCombatRecommendation({
                 effectiveLevel: params.effectiveLevel,
                 targetChance: params.targetChance,
+                targetSeconds: params.targetSeconds,
                 minDelta: AUTOMATION_RECOMMEND_MIN_DELTA,
                 maxDelta: AUTOMATION_RECOMMEND_MAX_DELTA,
                 evaluate: (roomLevel, budget) => computeAutomationEntryClearChanceByRoomLevel(
                     { ...params, recommendCombatTrials: budget }, roomLevel
                 ),
+            });
+        }
+        if (params.targetSeconds !== undefined) {
+            return ProductionChart.findProductionTimeRecommendation({
+                effectiveLevel: params.effectiveLevel, targetSeconds: params.targetSeconds,
+                minDelta: AUTOMATION_RECOMMEND_MIN_DELTA, maxDelta: AUTOMATION_RECOMMEND_MAX_DELTA,
+                evaluate: roomLevel => computeAutomationEntryClearChanceByRoomLevel(params, roomLevel),
             });
         }`);
     // Attach the full production curve after the original recommendation search.
@@ -69,22 +79,57 @@ export async function buildCalculators() {
     }
 
     async function runAutomationRecommendCalculation()`);
+    source=source.replace('async function runAutomationRecommendCalculation()',
+      'async function runAutomationRecommendCalculation(basis = "winRate")');
+    source=source.replace('automationEstimateRunningMode = "recommend";',
+      'automationEstimateRunningMode = "recommend";\n        automationRecommendBasis = basis;');
+    source=source.replace('const targetChance = clamp01(targetWinRate / 100);',
+      'const targetChance = clamp01(targetWinRate / 100);\n            const targetSeconds = basis === "seconds" ? TimeControls.getTargetSeconds() : undefined;');
+    source=source.replace('                        effectiveLevel,\n                        targetChance,',
+      '                        effectiveLevel,\n                        targetChance,\n                        targetSeconds,');
     // Verification must simulate anew rather than reuse an earlier random draw.
     source=source.replace('{ includePersonalBuffs: false }\n              )\n            : computeRoomClearChance',
       '{ includePersonalBuffs: false, disableCache: true }\n              )\n            : computeRoomClearChance');
     source=source.replace('clearChance: clamp01(finiteNumber(match.clearChance, 0)),',`clearChance: clamp01(finiteNumber(match.clearChance, 0)),
+                            basis: match.basis || 'winRate',
+                            fittedSeconds: match.fittedSeconds,
+                            expectedSecondsPerClear: match.result?.expectedSecondsPerClear,
                             fittedChance: match.fittedChance,
                             recommendationMethod: match.recommendationMethod,
                             recommendationChart: match.recommendationChart,`);
+    source=source.replace('recommendDelta: "Recommend Level",',
+      'recommendDelta: "Recommend by Win %",\n            recommendBySeconds: "Recommend by Time",\n            targetSeconds: "Target Time (s)",\n            targetSecondsHint: "Expected clear time including failed runs; recommends the closest fitted time",\n            fittedClearTime: "Fitted Clear Time",\n            simulatedClearTime: "Expected Clear Time",');
+    source=source.replace('recommendDelta: "推荐等级",',
+      'recommendDelta: "按胜率推荐",\n            recommendBySeconds: "按耗时推荐",\n            targetSeconds: "目标耗时(秒)",\n            targetSecondsHint: "含失败场次的预计通关耗时；推荐拟合耗时最接近目标的等级",\n            fittedClearTime: "拟合通关耗时",\n            simulatedClearTime: "预计通关耗时",');
+    source=source.replace('.${AUTOMATION_ESTIMATE_CONTROL_TARGET_RATE_INPUT_CLASS} {',
+      '.${AUTOMATION_ESTIMATE_CONTROL_TARGET_RATE_INPUT_CLASS}, .mwi-lab-auto-estimate-control__target-seconds-input {');
+    source=source.replace('        return root;\n    }\n\n    function getAutomationEstimateTrialsInput()',
+      `        TimeControls.sync(root, t, runAutomationRecommendCalculation, automationEstimateRunning,
+            automationEstimateRunningMode === 'recommend' ? automationRecommendBasis : '');
+        return root;
+    }
+
+    function getAutomationEstimateTrialsInput()`);
+    source=source.replace('running && runningMode === "recommend" ? t("calculating") : t("recommendDelta")',
+      'running && runningMode === "recommend" && automationRecommendBasis === "winRate" ? t("calculating") : t("recommendDelta")');
+    source=source.replace('        if (text && typeof status.message === "string"',
+      `        TimeControls.setRunning(root, t, Boolean(status.running),
+            automationEstimateRunningMode === 'recommend' ? automationRecommendBasis : '');
+        if (text && typeof status.message === "string"`);
+    source=source.replace('return `crate=${crateSignature}|trials=${trials}|target=${target}`;',
+      'return `crate=${crateSignature}|trials=${trials}|basis=${automationRecommendBasis}|target=${automationRecommendBasis === "seconds" ? TimeControls.getTargetSeconds() : target}`;');
     source=source.replace('recommendSettingLevel: "Recommend Setting Level",',
       'recommendSettingLevel: "Recommend Setting Level",\n            fittedWinRate: "Fitted Win Rate",\n            simulatedWinRate: "Simulated Win Rate",\n            winRateChart: "Chart",\n            winRateChartHint: "Click the recommended level to view the curve",');
     source=source.replace('recommendSettingLevel: "推荐设置等级",',
       'recommendSettingLevel: "推荐设置等级",\n            fittedWinRate: "拟合胜率",\n            simulatedWinRate: "模拟胜率",\n            winRateChart: "图表",\n            winRateChartHint: "点击推荐等级查看曲线",');
     source=source.replace('return `ready:${delta}:${roomLevel}:${chancePercent}`;',
-      'return `ready:${delta}:${roomLevel}:${chancePercent}:${estimate.fittedChance ?? ""}`;');
+      'return `ready:${delta}:${roomLevel}:${chancePercent}:${estimate.basis}:${estimate.fittedChance ?? ""}:${estimate.fittedSeconds ?? ""}`;');
     const tooltipLevel='        appendPreviewRow(tooltip, t("level"), `Lv.${Math.max(1, Math.floor(finiteNumber(estimate.roomLevel, 1)))}`);';
     source=source.replace(tooltipLevel,tooltipLevel+`
-        if (estimate.isCombat && Number.isFinite(estimate.fittedChance)) {
+        if (estimate.basis === 'seconds') {
+            if (estimate.isCombat) appendPreviewRow(tooltip, t("fittedClearTime"), TimeControls.formatSeconds(estimate.fittedSeconds));
+            appendPreviewRow(tooltip, t("simulatedClearTime"), TimeControls.formatSeconds(estimate.expectedSecondsPerClear));
+        } else if (estimate.isCombat && Number.isFinite(estimate.fittedChance)) {
             appendPreviewRow(tooltip, t("fittedWinRate"), (estimate.fittedChance * 100).toFixed(1) + "%");
             appendPreviewRow(tooltip, t("simulatedWinRate"), (estimate.clearChance * 100).toFixed(1) + "%");
         }

@@ -35,7 +35,7 @@ self.onmessage=async({data:m})=>{
       full.labyrinthStats=collectUpstreamStats(run,scenario,full,ratio=>progress(.1+.9*ratio));
     }
     const stats=full.labyrinthStats;
-    const result=summarizeResult(full);
+    const result=summarizeResult(full,'completed');
     const elapsedMs=performance.now()-started;
     self.postMessage({id:m.id,type:'result',result:{
       trials:result.trials,successes:result.successes,totalSpentSeconds:result.totalSpentSeconds,

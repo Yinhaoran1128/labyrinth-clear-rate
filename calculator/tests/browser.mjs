@@ -81,6 +81,11 @@ try {
       assert.ok(row.out.combatMeta.firstRunDebug.elapsedMs>=0);
       assert.equal(row.out.combatMeta.firstRunDebug.engineMode,mode);
       assert.match(row.out.combatMeta.firstRunDebug.wasmSha256,/^[a-f0-9]{64}$/);
+      const completedSeconds=row.out.combatMeta.firstRunDebug.fullCompletedSeconds;
+      assert.ok(Math.abs(row.out.combatMeta.totalSpentSeconds-completedSeconds)<.001,`${mode}: include all completed time`);
+      if(row.out.combatMeta.successes>0) {
+        assert.ok(Math.abs(row.out.expectedSecondsPerClear-completedSeconds/row.out.combatMeta.successes)<.001);
+      } else assert.equal(row.out.expectedSecondsPerClear,Infinity);
     }
     if(mode==='embedded') {
       const stockSource=legacyFactorySource(original).replace('    getGameState,getInitClientData,',
@@ -101,7 +106,9 @@ try {
       for(const [i,row] of result.entries()) {
         assert.equal(row.out.clearChance,baseline[i].clearChance,`embedded win rate ${i}`);
         for(const k of ['trials','successes','failedByDeath','failedByTimeout'])assert.equal(row.out.combatMeta[k],baseline[i].combatMeta[k],`${i}:${k}`);
-        if(Number.isFinite(baseline[i].expectedSecondsPerClear))assert.ok(Math.abs(row.out.expectedSecondsPerClear-baseline[i].expectedSecondsPerClear)<.001);
+        // Expected time deliberately differs from the original last-success
+        // convention. Check each engine mode's completed-time quotient above;
+        // JS and Rust cutoff clocks can also differ for death-only rooms.
       }
       const recommendation=await page.evaluate(async()=>{
         const api=window.calculatorTest,state=window.fixtureState,maps=JSON.parse(localStorage.getItem('initClientData'));
@@ -115,7 +122,8 @@ try {
         return {match,settingText:cell.textContent,tooltipText:tooltip.textContent};
       });
       assert.equal(recommendation.match.recommendationMethod,'weighted-isotonic');
-      assert.equal(recommendation.match.budget,1000);
+      assert.equal(recommendation.match.budget,3000);
+      assert.equal(recommendation.match.result.combatMeta.firstRunDebug.requestedTrials,3000,'engine budget must not be clamped to the old limit');
       assert.ok(recommendation.match.fittedChance>=0 && recommendation.match.fittedChance<=1);
       assert.equal(recommendation.match.clearChance,recommendation.match.result.clearChance,'raw engine estimate must remain available');
       assert.equal(Number(recommendation.settingText),recommendation.match.levelDelta+1,'preserve automation skip-threshold semantics');
@@ -186,6 +194,12 @@ try {
       });
       const button=page.locator('.mwi-lab-auto-estimate-control__recommend-button');
       await button.waitFor();
+      const timeButton=page.locator('.mwi-lab-auto-estimate-control__recommend-seconds-button');
+      assert.equal(await timeButton.count(),1,'time recommendation must have its own button');
+      const timeInput=page.locator('.mwi-lab-auto-estimate-control__target-seconds-input');
+      assert.equal(await timeInput.inputValue(),'300');
+      const winBox=await button.boundingBox(), timeBox=await timeButton.boundingBox();
+      assert.ok(timeBox.y>winBox.y,'time and win targets must occupy separate Greasyfork-style rows');
       await page.fill('.mwi-lab-auto-estimate-control__target-rate-input','70');
       await button.click();
       await page.waitForFunction(()=>{
@@ -212,7 +226,7 @@ try {
       const trace=await page.evaluate(()=>window.calculatorTest.getAutomationRecommendFromCell(
         document.querySelector('.mwi-lab-auto-recommend-cell[data-mwi-auto-room-key="shadow_archer"]')).recommendationChart);
       assert.ok(trace.observations.length>trace.levelCount,'must retain replaced simulation rounds');
-      assert.deepEqual([...new Set(trace.observations.map(row=>row.budget))].sort((a,b)=>a-b),[30,100,300,1000]);
+      assert.deepEqual([...new Set(trace.observations.map(row=>row.budget))].sort((a,b)=>a-b),[300,1000,3000]);
       const initialRange=await chart.locator('svg').getAttribute('data-level-range');
       const [initialLow,initialHigh]=initialRange.split(',').map(Number);
       assert.ok(initialLow<=trace.recommendedLevel && initialHigh>=trace.recommendedLevel,'default range includes recommendation');
@@ -322,6 +336,40 @@ try {
         assert.equal(await chart.count(),0);
         assert.equal(await cell.evaluate(node=>document.activeElement===node),true);
       }
+      await timeInput.fill('305');
+      await timeButton.click();
+      await page.waitForFunction(()=>{
+        const button=document.querySelector('.mwi-lab-auto-estimate-control__recommend-seconds-button');
+        const cells=[...document.querySelectorAll('.mwi-lab-auto-recommend-cell')];
+        return button && !button.disabled && cells.length===20 && cells.every(cell=>
+          window.calculatorTest.getAutomationRecommendFromCell(cell)?.basis==='seconds');
+      },null,{timeout:60000});
+      assert.equal(await page.evaluate(()=>localStorage.getItem('mwi_lab_auto_target_seconds')),'305');
+      await chartCell.click();
+      await chart.waitFor({state:'visible'});
+      assert.match(await chart.locator('h2').innerText(),/耗时|Time/);
+      assert.equal(await chart.locator('[data-error-bar]').count(),0,'binomial win intervals must not be presented as time intervals');
+      assert.match(await chart.innerText(),/305/);
+      assert.doesNotMatch(await chart.innerText(),/NaN|undefined|Wilson|置信区间/);
+      const timedTrace=await page.evaluate(()=>window.calculatorTest.getAutomationRecommendFromCell(
+        document.querySelector('.mwi-lab-auto-recommend-cell[data-mwi-auto-room-key="shadow_archer"]')).recommendationChart);
+      assert.equal(timedTrace.basis,'seconds');
+      assert.ok(timedTrace.curve.every((row,i,all)=>i===0 || row.fittedSeconds>=all[i-1].fittedSeconds));
+      assert.ok(await chart.locator('[data-fit-curve]').getAttribute('d'));
+      await page.screenshot({path:new URL('calculator-time-chart.png',output).pathname,fullPage:true});
+      await page.keyboard.press('Escape');
+      await page.setViewportSize({width:390,height:844});
+      const control=page.locator('#mwi-lab-auto-estimate-control');
+      await control.scrollIntoViewIfNeeded();
+      const timeControlBox=await timeInput.boundingBox();
+      assert.ok(timeControlBox.x>=0 && timeControlBox.x+timeControlBox.width<=390);
+      await page.screenshot({path:new URL('calculator-time-controls-mobile.png',output).pathname,fullPage:false});
+      await chartCell.click();
+      await chart.waitFor({state:'visible'});
+      assert.doesNotMatch(await chart.innerText(),/NaN|undefined/);
+      await page.screenshot({path:new URL('calculator-time-chart-mobile.png',output).pathname,fullPage:false});
+      await page.keyboard.press('Escape');
+      await page.setViewportSize({width:1200,height:800});
     }
     await page.screenshot({path:new URL(`calculator-${mode}.png`,output).pathname,fullPage:true});
     assert.deepEqual(errors,[]);

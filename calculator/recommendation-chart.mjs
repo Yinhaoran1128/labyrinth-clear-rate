@@ -1,7 +1,7 @@
 const ROOT_ID = 'mwi-lab-recommend-chart';
 const STYLE_ID = 'mwi-lab-recommend-chart-style';
 const NS = 'http://www.w3.org/2000/svg';
-const COLORS = {30:'#a78bfa',100:'#60a5fa',300:'#34d399',1000:'#fb7185'};
+const COLORS = {300:'#a78bfa',1000:'#60a5fa',3000:'#fb7185'};
 const COPY = {
   zh: {title:'胜率—等级曲线',close:'关闭图表',level:'房间等级',win:'胜率',recommended:'推荐等级',
     fit:'单调拟合',raw:'模拟胜率',target:'目标',ci:'95% 置信区间',focus:'目标附近',reset:'全部范围',
@@ -29,6 +29,15 @@ const PRODUCTION_COPY = {
     tableHint:'One record per integer level. Select a row to locate its point.'},
 };
 const percent = value => `${(value * 100).toFixed(1)}%`;
+const secondsText = value => Number.isFinite(value) ? `${value.toFixed(1)} s` : '∞';
+const TIME_COPY = {
+  zh: {title:'耗时—等级曲线',win:'预计通关耗时（秒）',raw:'预计通关耗时',
+    hint:'点击查看耗时—等级图',note:'预计通关耗时包含失败场次。耗时单调拟合按实际统计次数加权；每个等级仅使用最新轮次，历史轮次保留。∞ 表示本轮没有观察到通关；推荐拟合耗时最接近目标的等级，允许略超目标。',
+    productionNote:'预计通关耗时包含失败场次，直接使用公式结果。取整产生的阶梯变化保留原值；∞ 表示无法通关。推荐耗时最接近目标的等级，允许略超目标。'},
+  en: {title:'Clear time by level',win:'Expected clear time (s)',raw:'Expected clear time',
+    hint:'View clear time by level',note:'Includes failed runs. The monotone time fit is weighted by actual trial counts using the latest run per level; earlier runs are retained. ∞ means no clear was observed. Recommends the closest fitted time, which may exceed the target.',
+    productionNote:'Includes failed runs and uses formula results directly, preserving discrete steps. ∞ means unreachable. Recommends the closest time, which may exceed the target.'},
+};
 const intervalText = row => `${percent(row.confidenceInterval.lower)} – ${percent(row.confidenceInterval.upper)}`;
 const svgNode = (tag, attributes = {}, text) => {
   const node = document.createElementNS(NS, tag);
@@ -97,7 +106,8 @@ export function bindCell(cell, getEstimate, getLocale, beforeOpen) {
   ensureStyle();
   cell.classList.toggle('mwi-lab-chart-cell', enabled);
   if (enabled) {
-    const t = COPY[getLocale()] || COPY.en;
+    const language = COPY[getLocale()] ? getLocale() : 'en';
+    const t = {...COPY[language], ...(estimate.recommendationChart.basis === 'seconds' ? TIME_COPY[language] : {})};
     cell.setAttribute('role', 'button');
     cell.setAttribute('tabindex', '0');
     cell.setAttribute('aria-label', `${estimate.roomLabel}: ${cell.textContent}. ${t.hint}. ${t.keyboard}`);
@@ -124,8 +134,16 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
   document.getElementById(ROOT_ID)?.dispatchEvent(new Event('mwi-chart-close'));
   ensureStyle();
   const production = data.kind === 'production';
+  const timeMode = data.basis === 'seconds';
   const language = COPY[locale] ? locale : 'en';
-  const t = {...COPY[language], ...(production ? PRODUCTION_COPY[language] : {})};
+  const t = {...COPY[language], ...(production ? PRODUCTION_COPY[language] : {}),
+    ...(timeMode ? TIME_COPY[language] : {})};
+  if (production && timeMode) t.note = TIME_COPY[language].productionNote;
+  const formatValue = timeMode ? secondsText : percent;
+  const rawValue = row => timeMode ? row.expectedSecondsPerClear : row.clearChance;
+  const curveValue = row => timeMode ? production ? row.expectedSecondsPerClear : row.fittedSeconds
+    : production ? row.clearChance : row.fittedChance;
+  const target = timeMode ? data.targetSeconds : data.targetChance;
   const root = document.createElement('div');
   root.id = ROOT_ID;
   root.innerHTML = `<div class="mwi-chart-panel" role="dialog" aria-modal="true" aria-labelledby="mwi-chart-title" tabindex="-1">
@@ -139,7 +157,7 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
       <p class="mwi-chart-note">${t.note}</p>
     </div></div>`;
   root.querySelector('h2').textContent = `${title || ''} · ${t.title}`;
-  root.querySelector('.mwi-chart-subtitle').textContent = `${production ? '' : `${data.observations.length} ${t.simulations} · `}${data.levelCount} ${t.levels} · ${t.target} ${percent(data.targetChance)}`;
+  root.querySelector('.mwi-chart-subtitle').textContent = `${production ? '' : `${data.observations.length} ${t.simulations} · `}${data.levelCount} ${t.levels} · ${t.target} ${formatValue(target)}`;
   document.body.appendChild(root);
   const panel = root.querySelector('.mwi-chart-panel'), svg = root.querySelector('svg');
   const abort = new AbortController();
@@ -165,12 +183,14 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
 
   const latest = data.observations.filter(row => row.isLatest);
   const finalist = latest.find(row => row.roomLevel === data.recommendedLevel) || latest[0];
-  const fitted = data.curve.find(row => row.roomLevel === data.recommendedLevel)?.fittedChance;
+  const fittedRow = data.curve.find(row => row.roomLevel === data.recommendedLevel);
+  const fitted = fittedRow ? curveValue(fittedRow) : undefined;
   const cards = production
-    ? [[t.recommended, `Lv.${data.recommendedLevel}`],[t.raw, percent(finalist.clearChance)],
+    ? [[t.recommended, `Lv.${data.recommendedLevel}`],[t.raw, formatValue(rawValue(finalist))],
       [t.success, percent(finalist.successChance)],[t.attempts, finalist.attempts]]
-    : [[t.recommended, `Lv.${data.recommendedLevel}`],[t.fit, percent(fitted)],
-      [t.raw, percent(finalist.clearChance)],[t.ci, intervalText(finalist)]];
+    : [[t.recommended, `Lv.${data.recommendedLevel}`],[t.fit, formatValue(fitted)],
+      [t.raw, formatValue(rawValue(finalist))],
+      timeMode ? [COPY[language].win, percent(finalist.clearChance)] : [t.ci, intervalText(finalist)]];
   for (const [label,value] of cards) {
     const card = document.createElement('div');card.className='mwi-chart-card';
     const small = document.createElement('small'), strong = document.createElement('strong');
@@ -185,11 +205,12 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
   const visibleBudgets = new Set(production ? [] : data.observations.map(row => row.budget));
   const plot = {left:55,right:20,top:34,bottom:43,width:0,height:0};
   const x = level => plot.left + (level-range[0])/(range[1]-range[0])*(plot.width-plot.left-plot.right);
-  const y = chance => plot.top + (1-chance)*(plot.height-plot.top-plot.bottom);
+  let yMax = 1;
+  const y = value => plot.top + (1-Math.max(0,Math.min(1,value / yMax)))*(plot.height-plot.top-plot.bottom);
   const color = budget => production ? '#5eead4' : COLORS[budget] || '#94a3b8';
   const unitsText = value => Number.isFinite(value) ? String(value) : t.impossible;
   const productionDetails = row => [
-    `${t.raw} ${percent(row.clearChance)}`,`${t.success} ${percent(row.successChance)}`,
+    `${t.raw} ${formatValue(rawValue(row))}`,`${t.success} ${percent(row.successChance)}`,
     `${t.double} ${percent(row.doubleChance)}`,`${t.attempts} ${row.attempts}`,
     ...(row.type === 'enhancing' ? [`${t.enhancingTarget} +${row.targetLevel}`]
       : [`${t.progress} ${row.progressPerSuccess}`,`${t.targetProgress} ${row.targetProgress}`,`${t.needed} ${unitsText(row.neededUnits)}`]),
@@ -198,7 +219,7 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
     selected = row.id;
     root.querySelector('[data-point-detail]').textContent = production
       ? `Lv.${row.roomLevel} · ${productionDetails(row)}`
-      : `Lv.${row.roomLevel} · ${t.round} #${row.id} · ${t.budget} ${row.budget} · ${t.wins} ${row.successes}/${row.trials} · ${t.raw} ${percent(row.clearChance)} · ${t.ci} ${intervalText(row)} · ${row.isLatest?t.latest:t.old}`;
+      : `Lv.${row.roomLevel} · ${t.round} #${row.id} · ${t.budget} ${row.budget} · ${t.wins} ${row.successes}/${row.trials} · ${t.raw} ${formatValue(rawValue(row))}${timeMode ? '' : ` · ${t.ci} ${intervalText(row)}`} · ${row.isLatest?t.latest:t.old}`;
     for (const tr of root.querySelectorAll('tbody tr')) tr.dataset.selected = String(Number(tr.dataset.runId) === selected);
     for (const node of svg.querySelectorAll('[data-observation-id]')) {
       const active = Number(node.dataset.observationId) === selected;
@@ -227,13 +248,18 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
     svg.setAttribute('viewBox',`0 0 ${plot.width} ${plot.height}`);
     svg.setAttribute('data-level-range',range.join(','));
     svg.replaceChildren();
+    yMax = timeMode ? Math.max(target, ...data.observations
+      .filter(row => row.roomLevel >= range[0] && row.roomLevel <= range[1] && Number.isFinite(rawValue(row)))
+      .map(rawValue), ...data.curve.filter(row => row.roomLevel >= range[0] && row.roomLevel <= range[1] && Number.isFinite(curveValue(row)))
+      .map(curveValue)) * 1.1 : 1;
     const definitions=svgNode('defs');
     const clip=svgNode('clipPath',{id:'mwi-chart-plot-clip'});
     clip.appendChild(svgNode('rect',{x:plot.left,y:plot.top,width:plot.width-plot.left-plot.right,height:plot.height-plot.top-plot.bottom}));
     definitions.appendChild(clip);svg.appendChild(definitions);
     for (let chance=0;chance<=1.001;chance+=.2) {
-      svg.appendChild(svgNode('line',{x1:plot.left,x2:plot.width-plot.right,y1:y(chance),y2:y(chance),stroke:'#23364b'}));
-      svg.appendChild(svgNode('text',{x:plot.left-10,y:y(chance)+4,'text-anchor':'end',fill:'#8da7c5','font-size':11},`${Math.round(chance*100)}%`));
+      const value=chance*yMax;
+      svg.appendChild(svgNode('line',{x1:plot.left,x2:plot.width-plot.right,y1:y(value),y2:y(value),stroke:'#23364b'}));
+      svg.appendChild(svgNode('text',{x:plot.left-10,y:y(value)+4,'text-anchor':'end',fill:'#8da7c5','font-size':11},timeMode ? Number(value.toPrecision(3)).toLocaleString(language) : `${Math.round(chance*100)}%`));
     }
     const rawStep=(range[1]-range[0])/Math.max(3,Math.floor(plot.width/90));
     const magnitude=10**Math.floor(Math.log10(Math.max(1,rawStep)));
@@ -245,27 +271,33 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
     svg.appendChild(svgNode('text',{x:plot.left,y:18,fill:'#a7bfdc','font-size':11},t.win));
     svg.appendChild(svgNode('text',{x:(plot.left+plot.width-plot.right)/2,y:plot.height-7,'text-anchor':'middle',fill:'#a7bfdc','font-size':11},t.level));
     const layer=svgNode('g',{'clip-path':'url(#mwi-chart-plot-clip)'});svg.appendChild(layer);
-    const coordinates=data.curve.map(row=>`${x(row.roomLevel)},${y(production ? row.clearChance : row.fittedChance)}`);
-    if (coordinates.length) {
+    const coordinates=data.curve.filter(row=>Number.isFinite(curveValue(row))).map(row=>`${x(row.roomLevel)},${y(curveValue(row))}`);
+    let connected=false;
+    const curvePath=data.curve.map(row=>{
+      if (!Number.isFinite(curveValue(row))) {connected=false;return '';}
+      const command=connected?'L':'M';connected=true;
+      return `${command}${x(row.roomLevel)},${y(curveValue(row))}`;
+    }).join(' ');
+    if (coordinates.length && !timeMode) {
       const first=data.curve[0],last=data.curve.at(-1);
       layer.appendChild(svgNode('path',{d:`M${x(first.roomLevel)},${y(0)} L${coordinates.join(' L')} L${x(last.roomLevel)},${y(0)} Z`,fill:'#2dd4bf',opacity:.05}));
     }
-    layer.appendChild(svgNode('line',{x1:plot.left,x2:plot.width-plot.right,y1:y(data.targetChance),y2:y(data.targetChance),stroke:'#fbbf24','stroke-dasharray':'6 5',opacity:.8}));
+    layer.appendChild(svgNode('line',{x1:plot.left,x2:plot.width-plot.right,y1:y(target),y2:y(target),stroke:'#fbbf24','stroke-dasharray':'6 5',opacity:.8}));
     layer.appendChild(svgNode('line',{x1:x(data.recommendedLevel),x2:x(data.recommendedLevel),y1:plot.top,y2:plot.height-plot.bottom,stroke:'#fbbf24','stroke-dasharray':'3 5',opacity:.55}));
     for (const row of data.observations) {
-      if (production) break;
+      if (production || timeMode) break;
       if (!visibleBudgets.has(row.budget) || row.roomLevel<range[0] || row.roomLevel>range[1]) continue;
       const cx=x(row.roomLevel),lower=y(row.confidenceInterval.lower),upper=y(row.confidenceInterval.upper);
       const bar=svgNode('g',{'data-error-bar':row.id,stroke:color(row.budget),opacity:row.isLatest?.5:.23,'stroke-width':1.2});
       for (const attributes of [{x1:cx,x2:cx,y1:upper,y2:lower},{x1:cx-3,x2:cx+3,y1:upper,y2:upper},{x1:cx-3,x2:cx+3,y1:lower,y2:lower}]) bar.appendChild(svgNode('line',attributes));
       layer.appendChild(bar);
     }
-    layer.appendChild(svgNode('path',{[production ? 'data-calculated-curve' : 'data-fit-curve']:'',d:coordinates.length?`M${coordinates.join(' L')}`:'',fill:'none',stroke:'#5eead4','stroke-width':2.5,'stroke-linejoin':'round','stroke-linecap':'round'}));
+    layer.appendChild(svgNode('path',{[production ? 'data-calculated-curve' : 'data-fit-curve']:'',d:curvePath,fill:'none',stroke:'#5eead4','stroke-width':2.5,'stroke-linejoin':'round','stroke-linecap':'round'}));
     for (const row of data.observations) {
       if ((!production && !visibleBudgets.has(row.budget)) || row.roomLevel<range[0] || row.roomLevel>range[1]) continue;
       const label = production ? `Lv.${row.roomLevel} · ${productionDetails(row)}`
-        : `Lv.${row.roomLevel}, ${t.round} ${row.id}, ${percent(row.clearChance)}, ${t.ci} ${intervalText(row)}`;
-      const point=svgNode('circle',{cx:x(row.roomLevel),cy:y(row.clearChance),r:production?2.5:row.isLatest?4.5:3.3,fill:color(row.budget),opacity:row.isLatest?1:.65,
+        : `Lv.${row.roomLevel}, ${t.round} ${row.id}, ${formatValue(rawValue(row))}${timeMode ? '' : `, ${t.ci} ${intervalText(row)}`}`;
+      const point=svgNode('circle',{cx:x(row.roomLevel),cy:y(rawValue(row)),r:production?2.5:row.isLatest?4.5:3.3,fill:Number.isFinite(rawValue(row))?color(row.budget):'none',opacity:row.isLatest?1:.65,
         'data-observation-id':row.id,...(production?{}:{'data-budget':row.budget}),tabindex:0,role:'button','aria-label':label});
       point.appendChild(svgNode('title',{},label));
       point.onpointerenter=()=>detail(row);point.onfocus=()=>detail(row);
@@ -274,7 +306,7 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
       layer.appendChild(point);
     }
     const labelX=plot.width-plot.right-6;
-    svg.appendChild(svgNode('text',{x:labelX,y:Math.max(plot.top+13,Math.min(plot.height-plot.bottom-6,y(data.targetChance)-8)),'text-anchor':'end',fill:'#fbbf24','font-size':11},`${t.target} ${percent(data.targetChance)}`));
+    svg.appendChild(svgNode('text',{x:labelX,y:Math.max(plot.top+13,Math.min(plot.height-plot.bottom-6,y(target)-8)),'text-anchor':'end',fill:'#fbbf24','font-size':11},`${t.target} ${formatValue(target)}`));
     detail(data.observations.find(row=>row.id===selected) || finalist);
     if (focusedId !== null) {
       // Resize/zoom replaces SVG children. Keep keyboard focus inside the dialog,
@@ -297,16 +329,17 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
   const enhancing = production && finalist.type === 'enhancing';
   const columns = production ? [t.level,t.raw,t.success,t.double,t.attempts,
     ...(enhancing ? [t.enhancingTarget] : [t.progress,t.targetProgress,t.needed])]
-    : [t.round,t.level,t.budget,t.wins,t.trials,t.raw,t.ci,t.fit];
+    : [t.round,t.level,t.budget,t.wins,t.trials,t.raw,...(timeMode?[]:[t.ci]),t.fit];
   for(const label of columns) {
     const th=document.createElement('th');th.textContent=label;head.appendChild(th);
   }
-  const fittedByLevel=new Map(data.curve.map(row=>[row.roomLevel,row.fittedChance]));
+  const fittedByLevel=new Map(data.curve.map(row=>[row.roomLevel,curveValue(row)]));
   for(const row of [...data.observations].sort((a,b)=>a.roomLevel-b.roomLevel||a.id-b.id)) {
     const tr=document.createElement('tr');tr.tabIndex=0;tr.dataset.runId=row.id;
-    const values = production ? [row.roomLevel,percent(row.clearChance),percent(row.successChance),percent(row.doubleChance),row.attempts,
+    const values = production ? [row.roomLevel,formatValue(rawValue(row)),percent(row.successChance),percent(row.doubleChance),row.attempts,
       ...(enhancing ? [`+${row.targetLevel}`] : [row.progressPerSuccess,row.targetProgress,unitsText(row.neededUnits)])]
-      : [`#${row.id}`,row.roomLevel,row.budget,row.successes,row.trials,percent(row.clearChance),intervalText(row),row.isLatest?percent(fittedByLevel.get(row.roomLevel)):t.old];
+      : [`#${row.id}`,row.roomLevel,row.budget,row.successes,row.trials,formatValue(rawValue(row)),
+        ...(timeMode?[]:[intervalText(row)]),row.isLatest?formatValue(fittedByLevel.get(row.roomLevel)):t.old];
     for(const value of values) {
       const td=document.createElement('td');td.textContent=String(value);tr.appendChild(td);
     }

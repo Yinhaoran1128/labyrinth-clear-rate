@@ -14,14 +14,17 @@ export function binomialWinRateInterval(p, n) {
     confidenceLevel: .95, method: 'wilson'};
 }
 
-export function createRecommendationChartData({history, fit, targetChance, recommendedLevel}) {
+export function createRecommendationChartData({history, fit, targetChance, targetSeconds, recommendedLevel}) {
+  const timeMode = targetSeconds !== undefined;
   const lastByLevel = new Map(history.map(row => [row.roomLevel, row.id]));
   return {
+    basis: timeMode ? 'seconds' : 'winRate', targetSeconds,
     targetChance, recommendedLevel, levelCount: lastByLevel.size,
     observations: history.map(row => ({...row,
       isLatest: lastByLevel.get(row.roomLevel) === row.id,
-      confidenceInterval: binomialWinRateInterval(row.clearChance, row.trials),
+      ...(timeMode ? {} : {confidenceInterval: binomialWinRateInterval(row.clearChance, row.trials)}),
     })),
-    curve: fit.map(row => ({roomLevel: row.roomLevel, fittedChance: row.fittedChance})),
+    curve: fit.map(row => ({roomLevel: row.roomLevel,
+      ...(timeMode ? {fittedSeconds: row.fittedSeconds} : {fittedChance: row.fittedChance})})),
   };
 }

@@ -6,16 +6,34 @@ import { fixtureGame, fixturePlayer } from './fixtures.mjs';
 test('rejects invalid levels, trial budgets and seeds before any engine starts', () => {
   assert.deepEqual(validateSettings({level:100, trials:100, seed:0}), {level:100, trials:100, seed:0});
   for (const level of [0, -1, 1.5, NaN]) assert.throws(() => validateSettings({level, trials:100}));
-  for (const trials of [0, 2001, 1.5, NaN]) assert.throws(() => validateSettings({level:100, trials}));
+  for (const trials of [0, 3001, 1.5, NaN]) assert.throws(() => validateSettings({level:100, trials}));
   assert.throws(() => validateSettings({level:100, trials:100, seed:4294967296}));
 });
 
-test('keeps the original expected-time convention including failures after the last win', () => {
+test('comparison diagnostics retain the original expected-time convention', () => {
   const result = summarizeResult({trials:3, successes:1, totalSpentSeconds:30, failedByDeath:2, failedByTimeout:0});
   assert.equal(result.clearChance, 1/3);
   assert.equal(result.expectedSecondsPerClear, 30);
   assert.equal(result.failures, 2);
   assert.equal(summarizeResult({trials:10, successes:0, totalSpentSeconds:1200}).expectedSecondsPerClear, Infinity);
+});
+
+test('calculator time includes every completed failure after the last win, but excludes an unfinished tail', () => {
+  const raw={lastEncounterFinishTime:30e9, simulatedTime:300e9,
+    labyrinthStats:{completedTrials:4, successes:2, failedByDeath:1, failedByTimeout:1, completedSpentNs:270e9}};
+  const result=summarizeResult(raw, 'completed');
+  assert.equal(result.totalSpentSeconds,270);
+  assert.equal(result.expectedSecondsPerClear,135);
+  assert.equal(result.clearChance,.5);
+  assert.equal(summarizeResult(raw).expectedSecondsPerClear,15,'retain legacy comparison diagnostics');
+  const noClear=summarizeResult({simulatedTime:300e9,
+    labyrinthStats:{completedTrials:2, successes:0, failedByDeath:0, failedByTimeout:2, completedSpentNs:240e9}},'completed');
+  assert.equal(noClear.totalSpentSeconds,240);
+  assert.equal(noClear.expectedSecondsPerClear,Infinity);
+  const unfinished=summarizeResult({simulatedTime:100e9,
+    labyrinthStats:{completedTrials:0, successes:0, failedByDeath:0, failedByTimeout:0, completedSpentNs:0}},'completed');
+  assert.equal(unfinished.totalSpentSeconds,0);
+  assert.equal(unfinished.expectedSecondsPerClear,Infinity);
 });
 
 test('Rust results use completed trials and expose full completed time separately', () => {
@@ -45,6 +63,9 @@ test('adapts labyrinth upgrades, preserves triggers and removes consumables with
     mazeDifficulty:100, trials:100, seed:7, mazeCrateItemHrids:[]});
   assert.equal(sc.combatMode, 'labyrinth');
   assert.equal(sc.simulationTimeLimit, 12000e9);
+  const finalRun=makeRustScenario(fixtureGame(), {playerDto:dto, monsterHrid:'/monsters/shadow_archer',
+    mazeDifficulty:100, trials:3000, seed:7, mazeCrateItemHrids:[]});
+  assert.equal(finalRun.simulationTimeLimit, 360000e9);
   assert.equal(sc.labyrinth.monsterHrid, '/monsters/shadow_archer');
   assert.equal(sc.labyrinthFixedMonsterCooldown, true);
   assert.equal(sc.labyrinthLegacyFury, true);

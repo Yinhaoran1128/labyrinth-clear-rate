@@ -52,3 +52,15 @@ test('does not plot missing or invalid formula results as zero wins', async () =
   await assert.rejects(()=>chart({...params,evaluate:async()=>null}),/结果/);
   await assert.rejects(()=>chart({...params,evaluate:async()=>({...computed(1),clearChance:NaN})}),/胜率/);
 });
+
+test('production time mode selects the closest formula time without relying on monotonicity', async () => {
+  assert.equal(typeof api.findProductionTimeRecommendation, 'function');
+  const values = [250, 310, Infinity, 290, 400];
+  const out = await api.findProductionTimeRecommendation({effectiveLevel: 10, minDelta: -2, maxDelta: 2,
+    targetSeconds: 300, evaluate: async level => ({...computed(level),
+      result: {...computed(level).result, expectedSecondsPerClear: values[level - 8]}})});
+  assert.equal(out.roomLevel, 11); // 310 and 290 tie; prefer the higher level.
+  assert.equal(out.result.expectedSecondsPerClear, 290);
+  assert.equal(out.recommendationChart.basis, 'seconds');
+  assert.deepEqual(out.recommendationChart.curve.map(row => row.expectedSecondsPerClear), values);
+});

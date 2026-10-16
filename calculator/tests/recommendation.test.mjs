@@ -15,6 +15,51 @@ const search = options => {
 const observation = (roomLevel, chance, trials = 100) => ({roomLevel, clearChance: chance,
   result: {clearChance: chance, combatMeta: {trials, successes: chance * trials}}});
 
+const timed = (level, seconds, trials = 100) => {
+  const sample = observation(level, Number.isFinite(seconds) ? .5 : 0, trials);
+  return {...sample, result: {...sample.result, expectedSecondsPerClear: seconds}};
+};
+test('time fitting pools reversals using actual trial weights and preserves raw seconds', () => {
+  assert.equal(typeof api.fitIncreasingClearSeconds, 'function');
+  const input = [timed(10, 100), timed(11, 300, 10), timed(12, 150, 20)];
+  const out = api.fitIncreasingClearSeconds(input);
+  assert.deepEqual(out.map(row => row.fittedSeconds), [100, 200, 200]);
+  assert.equal(input[1].result.expectedSecondsPerClear, 300);
+});
+test('time recommendation uses closest unrounded fitted seconds, permits exceeding target and verifies finalist', async () => {
+  const out = await search({effectiveLevel: 100, targetSeconds: 304,
+    evaluate: async (level, budget) => timed(level, 100 + level * 3, budget * 2)});
+  assert.equal(out.roomLevel, 68); // 304 seconds exactly; win rate is identical at every level.
+  assert.equal(out.fittedSeconds, 304);
+  assert.equal(out.budget, 3000);
+  assert.equal(out.recommendationChart.basis, 'seconds');
+  assert.equal(out.recommendationChart.targetSeconds, 304);
+  assert.ok(out.recommendationChart.observations.every(row => row.expectedSecondsPerClear > 0));
+  assert.ok(out.recommendationChart.observations.every(row => row.confidenceInterval === undefined));
+  const over = await search({effectiveLevel: 100, targetSeconds: 305.8,
+    evaluate: async (level, budget) => timed(level, 100 + level * 3, budget)});
+  assert.equal(over.roomLevel, 69); // 307 is closer than 304.
+});
+test('time ties choose the highest level of the closest plateau', async () => {
+  const out = await search({effectiveLevel: 100, targetSeconds: 300,
+    evaluate: async (level, budget) => timed(level, level <= 80 ? 250 : level <= 200 ? 350 : 500, budget)});
+  assert.equal(out.roomLevel, 200);
+});
+test('time search replaces misleading coarse results and retains infinite no-clear samples', async () => {
+  const out = await search({effectiveLevel: 100, targetSeconds: 300,
+    evaluate: async (level, budget) => timed(level,
+      level === 100 && budget === 300 ? Infinity : level * 3, budget)});
+  assert.equal(out.roomLevel, 100);
+  assert.equal(out.fittedSeconds, 300);
+  assert.ok(out.recommendationChart.observations.some(row => row.expectedSecondsPerClear === Infinity));
+  const none = await search({effectiveLevel: 2, targetSeconds: 300, minDelta: -2, maxDelta: 3,
+    evaluate: async (level, budget) => timed(level, Infinity, budget)});
+  assert.equal(none.fittedSeconds, Infinity);
+  assert.equal(none.roomLevel, 1);
+  await assert.rejects(() => search({effectiveLevel: 100, targetSeconds: 300,
+    evaluate: async level => timed(level, NaN)}), /耗时/);
+});
+
 // Catch equal weighting, the wrong monotone direction, and missing cascading merges.
 test('weights by actual completed statistics and pools cascading reversals', () => {
   const rows = [observation(120, .9), observation(100, .8), observation(110, .6, 10)];
@@ -52,7 +97,7 @@ test('locates and verifies the nearest integer level on a decreasing curve', asy
   assert.equal(out.roomLevel, 150);
   assert.equal(out.levelDelta, 50);
   assert.ok(Math.abs(out.fittedChance - .7) < 1e-12);
-  assert.ok(calls.some(x => x.level === 150 && x.budget > 30), 'finalist must be verified beyond the coarse budget');
+  assert.ok(calls.some(x => x.level === 150 && x.budget > 300), 'finalist must be verified beyond the coarse budget');
   assert.ok(calls.every(x => x.level >= 1 && x.level <= 400));
   assert.ok(calls.length < 80, 'must not exhaustively simulate the entire range');
 });
@@ -85,9 +130,9 @@ test('rejects missing or empty statistics instead of giving them arbitrary fit w
 test('relocates after a coarse sample wrongly sends the search downward', async () => {
   const out = await search({effectiveLevel: 100, targetChance: .7,
     evaluate: async (level, budget) => observation(level,
-      level === 100 && budget === 30 ? .3 : Math.max(0, Math.min(1, .7 - (level - 100) * .01)), budget)});
+      level === 100 && budget === 300 ? .3 : Math.max(0, Math.min(1, .7 - (level - 100) * .01)), budget)});
   assert.equal(out.roomLevel, 100);
-  assert.equal(out.budget, 1000);
+  assert.equal(out.budget, 3000);
 });
 test('finds the highest level of a wide plateau matching the target', async () => {
   let calls = 0;
@@ -127,12 +172,13 @@ test('returns every completed simulation round including replaced coarse samples
   assert.ok(out.recommendationChart, 'recommendation chart trace is missing');
   const trace = out.recommendationChart;
   assert.equal(trace.observations.length, calls);
+  assert.deepEqual([...new Set(trace.observations.map(row => row.budget))].sort((a,b) => a-b), [300,1000,3000]);
   assert.equal(trace.targetChance, .7);
   assert.equal(trace.recommendedLevel, 150);
-  assert.deepEqual(trace.observations.filter(row => row.roomLevel === 150).map(row => row.budget), [30, 100, 300, 1000]);
+  assert.deepEqual(trace.observations.filter(row => row.roomLevel === 150).map(row => row.budget), [300, 1000, 3000]);
   assert.equal(trace.observations.filter(row => row.isLatest).length, trace.curve.length);
   const final = trace.observations.find(row => row.roomLevel === 150 && row.isLatest);
-  assert.equal(final.trials, 2000);
+  assert.equal(final.trials, 6000);
   assert.equal(final.confidenceInterval.confidenceLevel, .95);
   assert.ok(final.confidenceInterval.lower < .7 && final.confidenceInterval.upper > .7);
 });
