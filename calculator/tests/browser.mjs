@@ -57,6 +57,8 @@ try {
     await page.addScriptTag({content:source});
     await page.waitForSelector('#mwi-lab-clear-rate-control');
     assert.match(await page.locator('#mwi-lab-clear-rate-control').innerText(),/Rust 内置修正版/);
+    const calculationProgress='#mwi-lab-clear-rate-control .mwi-lab-clear-rate-control__progress, #mwi-lab-clear-rate-control .mwi-lab-clear-rate-control__bar, [data-cancel-battles]';
+    assert.equal(await page.locator(calculationProgress).count(),0,'calculator has no progress display or cancel button');
     const result=await page.evaluate(async()=>{
       const api=window.calculatorTest,state=window.fixtureState,maps=JSON.parse(localStorage.getItem('initClientData'));
       const rows=[];
@@ -97,10 +99,18 @@ try {
       api.upsertAutomationEstimateCellContent(cell,{status:'ready',isCombat:true,roomLevel:80,
         clearChance:out.clearChance,expectedSeconds:out.expectedSecondsPerClear,etaText:'100 s',
         clearTimeInterval:out.clearTimeInterval});
-      return {ordinary,inline:cell.querySelector('[data-clear-time-ci]')?.textContent};
+      const estimate={status:'ready',roomLabel:'暗影弓手',isCombat:true,roomLevel:80,
+        clearChance:out.clearChance,clearTimeInterval:out.clearTimeInterval};
+      const tooltip=api.renderAutomationEstimateTooltip(estimate).textContent;
+      const detailed=api.renderAutomationEstimateTooltip({...estimate,detailPreview:preview}).textContent;
+      return {ordinary,inline:cell.querySelector('[data-clear-time-ci]')?.textContent,tooltip,detailed,
+        resultText:cell.textContent};
     },result[0]);
-    assert.match(ciDisplays.ordinary,/95%/);
-    assert.match(ciDisplays.inline,/95%/);
+    assert.doesNotMatch(ciDisplays.ordinary,/95%/,'ordinary combat preview omits confidence intervals');
+    assert.equal(ciDisplays.inline,undefined,'calculate win-rate cell omits confidence intervals');
+    assert.doesNotMatch(ciDisplays.tooltip,/95%/,'basic tooltip without details omits confidence intervals');
+    assert.doesNotMatch(ciDisplays.detailed,/95%/,'basic tooltip with combat details omits confidence intervals');
+    assert.match(ciDisplays.resultText,/100 s/,'expected clear time remains visible');
     const progressive=await page.evaluate(async params=>{
       const api=window.calculatorTest,rows=[],progress=[];
       for(const trials of [300,1000,3000,1000]) {
@@ -178,7 +188,9 @@ try {
           recommendCombatTrials:30});
         const cell=document.createElement('td');
         api.upsertAutomationRecommendCellContent(cell,{status:'ready',...match});
-        const tooltip=api.renderAutomationEstimateTooltip({status:'ready',roomLabel:'暗影弓手',isCombat:true,...match});
+        const tooltip=api.renderAutomationEstimateTooltip({status:'ready',roomLabel:'暗影弓手',isCombat:true,...match,
+          clearTimeInterval:match.result.clearTimeInterval,
+          detailPreview:api.buildCombatPreview(state,match.room,maps,match.result)});
         return {match,settingText:cell.textContent,tooltipText:tooltip.textContent};
       });
       assert.equal(recommendation.match.recommendationMethod,'weighted-isotonic');
@@ -190,6 +202,7 @@ try {
       assert.equal(Number(recommendation.settingText),recommendation.match.levelDelta+1,'preserve automation skip-threshold semantics');
       assert.match(recommendation.tooltipText,/拟合胜率|Fitted Win Rate/);
       assert.match(recommendation.tooltipText,/模拟胜率|Simulated Win Rate/);
+      assert.match(recommendation.tooltipText,/95%/,'recommendation details retain confidence intervals');
       const cacheSources=await page.evaluate(async()=>{
         const api=window.calculatorTest,state=window.fixtureState,maps=JSON.parse(localStorage.getItem('initClientData'));
         const params={state,initClientData:maps,
@@ -231,34 +244,19 @@ try {
     assert.equal(progressiveCancel.cancelled,true);
     assert.equal(progressiveCancel.after.trials,40);
     assert.deepEqual(progressiveCancel.after.firstRunDebug.batches.map(row=>row.trials),[6,34]);
-    // Exercise the visible cancel control while an ordinary calculation is active.
-    await page.fill('#mwi-lab-clear-rate-control input[type=number]','3000');
-    await page.click('#mwi-lab-clear-rate-control button');
-    const cancelButton=page.locator('#mwi-lab-clear-rate-control [data-cancel-battles]');
-    await cancelButton.waitFor({state:'visible'});
-    await cancelButton.click();
-    await page.waitForFunction(()=>/已取消计算|Calculation cancelled/.test(
-      document.querySelector('#mwi-lab-clear-rate-control').textContent));
-    assert.equal(await page.locator('#mwi-lab-clear-rate-control button').first().isEnabled(),true);
     // Exercise the original real user flow, not only the calculation facade.
     await page.fill('#mwi-lab-clear-rate-control input[type=number]','1');
     await page.click('#mwi-lab-clear-rate-control button');
     try {
-      await page.waitForFunction(()=>/计算完成|Calculation complete/.test(document.querySelector('#mwi-lab-clear-rate-control').textContent),null,{timeout:15000});
+      await page.waitForFunction(()=>!document.querySelector('#mwi-lab-clear-rate-control .mwi-lab-clear-rate-control__button').disabled &&
+        document.querySelectorAll('.mwi-lab-clear-rate-badge').length===10,null,{timeout:15000});
     } catch(error) {
       console.log({mode,status:await page.locator('#mwi-lab-clear-rate-control').innerText(),errors});
       await page.screenshot({path:new URL(`calculator-${mode}-failure.png`,output).pathname,fullPage:true});
       throw error;
     }
     assert.equal(await page.locator('.mwi-lab-clear-rate-badge').count(),10,'all rooms must receive the original overlay');
-    // Cancel during the inter-row animation frame when every combat result is cached.
-    await page.evaluate(()=>{
-      requestAnimationFrame(()=>document.querySelector('#mwi-lab-clear-rate-control [data-cancel-battles]').click());
-      document.querySelector('#mwi-lab-clear-rate-control .mwi-lab-clear-rate-control__button').click();
-    });
-    await page.waitForFunction(()=>/已取消计算|Calculation cancelled/.test(
-      document.querySelector('#mwi-lab-clear-rate-control').textContent));
-    assert.equal(await page.locator('#mwi-lab-clear-rate-control button').first().isEnabled(),true);
+    assert.equal(await page.locator(calculationProgress).count(),0);
     if(mode==='embedded') {
       const productionBaseline=await page.evaluate(async()=>{
         const api=window.calculatorTest,state=window.fixtureState,maps=JSON.parse(localStorage.getItem('initClientData'));
@@ -294,13 +292,12 @@ try {
       assert.equal(await timeInput.inputValue(),'300');
       const winBox=await button.boundingBox(), timeBox=await timeButton.boundingBox();
       assert.ok(timeBox.y>winBox.y,'time and win targets must occupy separate Greasyfork-style rows');
-      await button.click();
-      const autoCancel=page.locator('#mwi-lab-auto-estimate-control [data-cancel-battles]');
-      await autoCancel.waitFor({state:'visible'});
-      await autoCancel.click();
-      await page.waitForFunction(()=>/已取消计算|Calculation cancelled/.test(
-        document.querySelector('.mwi-lab-auto-estimate-control__status').textContent));
-      await page.waitForFunction(()=>!document.querySelector('.mwi-lab-auto-estimate-control__recommend-button').disabled);
+      await page.evaluate(()=>{
+        window.calculatorStatusMessages=[];
+        const status=document.querySelector('.mwi-lab-auto-estimate-control__status');
+        new MutationObserver(()=>window.calculatorStatusMessages.push(status.textContent))
+          .observe(status,{childList:true,characterData:true,subtree:true});
+      });
       await page.fill('.mwi-lab-auto-estimate-control__target-rate-input','70');
       await button.click();
       await page.waitForFunction(()=>{
@@ -317,6 +314,9 @@ try {
       assert.ok(rows.filter(row=>row.isCombat).every(row=>row.method==='weighted-isotonic' && Number.isFinite(row.fittedChance)));
       assert.ok(rows.filter(row=>!row.isCombat).every(row=>row.method===undefined),'skilling must retain its original recommendation');
       assert.ok(rows.every(row=>row.setting===row.levelDelta+1));
+      assert.equal(await page.locator(calculationProgress).count(),0);
+      assert.ok((await page.evaluate(()=>window.calculatorStatusMessages)).every(text=>!/[0-9]+\s*\/\s*[0-9]+|[0-9]+%/.test(text)),
+        'running recommendation status contains no numeric progress');
       await page.locator('.mwi-lab-auto-recommend-cell[data-mwi-auto-room-key="shadow_archer"]').hover();
       await page.waitForFunction(()=>/Fitted Win Rate|拟合胜率/.test(document.querySelector('#mwi-lab-clear-rate-preview')?.textContent));
       const chartCell=page.locator('.mwi-lab-auto-recommend-cell[data-mwi-auto-room-key="shadow_archer"]');
@@ -479,7 +479,8 @@ try {
     await page.screenshot({path:new URL(`calculator-${mode}.png`,output).pathname,fullPage:true});
     assert.deepEqual(errors,[]);
     fs.writeFileSync(new URL(`calculator-${mode}.json`,output),JSON.stringify(result,null,2));
-    console.log(JSON.stringify({mode,monsters:10,downloadRequests:requests,checks:['real Worker/WASM','original calculator UI','cumulative progress','engine provenance','exact battle counts','monotone recommendation','300/700/2000 batches and seed replay','cumulative cache','single point per level','recommend button and hover','cancellation and retained samples']}));
+    assert.equal(await page.locator(calculationProgress).count(),0);
+    console.log(JSON.stringify({mode,monsters:10,downloadRequests:requests,checks:['real Worker/WASM','calculator UI without progress or cancel controls','engine provenance','exact battle counts','monotone recommendation','300/700/2000 batches and seed replay','cumulative cache','single point per level','recommend button and hover','Worker reset and retained samples']}));
     await page.close();
   }
 } finally {await browser.close();server.close();}

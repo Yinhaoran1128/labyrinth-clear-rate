@@ -22,7 +22,6 @@ export async function buildCalculators() {
   const production=await compile('production-chart.mjs',{globalName:'ProductionChart'});
   const chart=await compile('recommendation-chart.mjs',{globalName:'RecommendationChart'});
   const controls=await compile('automation-controls.mjs',{globalName:'TimeControls'});
-  const cancellation=await compile('cancellation-controls.mjs',{globalName:'CancelControls'});
   const intervals=await compile('clear-time-interval.mjs',{globalName:'ClearTimeIntervals'});
   const stock=await stockEngine();
   const data=packed(JSON.stringify({fallbackData:fixtureGame().$e,originalMaps:stock.maps}));
@@ -36,15 +35,15 @@ export async function buildCalculators() {
       .replace(/\/\/ @name(?:\:zh-CN)?\s+迷宫胜率计算器/g,match=>match.replace('迷宫胜率计算器',`迷宫胜率计算器（${label}）`))
       .replace(/\/\/ @name:en[^\n]+/,'// @name:en      Labyrinth Calculator '+'Rust Embedded')
       .replace(/\/\/ @namespace[^\n]+/,`// @namespace    mwi-labyrinth-calculator-rust-embedded`)
-      .replace(/\/\/ @version[^\n]+/,'// @version      1.8.1')
+      .replace(/\/\/ @version[^\n]+/,'// @version      1.8.2')
       .replace(/\/\/ @author[^\n]+/,'// @author       dakonglong; wow121; Yinhr (Rust adapter)')
       .replace(/\/\/ @description:zh-CN[^\n]+/,`// @description:zh-CN  原版迷宫界面与配装逻辑；${label}计算战斗胜率和预计通关耗时。`)
       .replace(/^\/\/ @(?:downloadURL|updateURL)[^\n]+\n/gm,'')
-      .replace(/window\.__MWI_LAB_CLEAR_RATE_OVERLAY_VERSION__ = "[^"]+";/,`window.__MWI_LAB_CLEAR_RATE_OVERLAY_VERSION__ = "1.8.1-rust-embedded";`)
+      .replace(/window\.__MWI_LAB_CLEAR_RATE_OVERLAY_VERSION__ = "[^"]+";/,`window.__MWI_LAB_CLEAR_RATE_OVERLAY_VERSION__ = "1.8.2-rust-embedded";`)
       .replace('const MAX_COMBAT_SIM_TRIALS = 2000;', 'const MAX_COMBAT_SIM_TRIALS = 3000;')
       .replace(/const COMBAT_MODEL_SIGNATURE = "[^"]+";/,`const COMBAT_MODEL_SIGNATURE = "${model}";`);
     const insert=source.indexOf('    const ROOM_DURATION_SECONDS =');
-    source=source.slice(0,insert)+`\n${runtime}\n${recommendation}\n${production}\n${chart}\n${controls}\n${cancellation}\n${intervals}\n    let combatCalculationCancelled = false;\n    const cancelledMessage = () => isChineseUi() ? "已取消计算" : "Calculation cancelled";\n    function cancelCombatCalculation() {\n        combatCalculationCancelled = true;\n        resetCombatSimulatorWorker(new Error(cancelledMessage()));\n    }\n    let automationRecommendBasis = 'winRate';\n    const rustCalculator = CalculatorRuntime.create(${JSON.stringify(assets)});\n`+source.slice(insert);
+    source=source.slice(0,insert)+`\n${runtime}\n${recommendation}\n${production}\n${chart}\n${controls}\n${intervals}\n    let automationRecommendBasis = 'winRate';\n    const rustCalculator = CalculatorRuntime.create(${JSON.stringify(assets)});\n`+source.slice(insert);
     // Apply the new search only to combat; the pinned original remains unchanged.
     source=source.replace('    async function findAutomationRecommendedLevelDelta(params) {',`
     async function findAutomationRecommendedLevelDelta(params) {
@@ -149,7 +148,7 @@ export async function buildCalculators() {
             appendPreviewRow(tooltip, t("fittedWinRate"), (estimate.fittedChance * 100).toFixed(1) + "%");
             appendPreviewRow(tooltip, t("simulatedWinRate"), (estimate.clearChance * 100).toFixed(1) + "%");
         }
-        if (estimate.isCombat && estimate.clearTimeInterval && !estimate.detailPreview?.clearTimeInterval)
+        if (estimate.isCombat && estimate.recommendationChart && estimate.clearTimeInterval)
             appendPreviewRow(tooltip, isChineseUi() ? "通关耗时近似95%置信区间" : "Clear time approx. 95% CI",
                 ClearTimeIntervals.formatClearTimeInterval(estimate.clearTimeInterval, isChineseUi() ? "zh" : "en"));
         if (estimate.recommendationChart) appendPreviewRow(tooltip, t("winRateChart"), t("winRateChartHint"));`);
@@ -160,55 +159,19 @@ export async function buildCalculators() {
       '        cell.classList.add(AUTOMATION_RECOMMEND_CELL_CLASS);'+bindChartCell);
     source=source.replace('        cell.textContent = formatAutomationSignedDelta(settingLevel);',
       '        cell.textContent = formatAutomationSignedDelta(settingLevel);'+bindChartCell);
-    source=source.replace('manualUpdateRunning = true;', 'manualUpdateRunning = true;\n        combatCalculationCancelled = false;')
-      .replaceAll('automationEstimateRunning = true;', 'automationEstimateRunning = true;\n        combatCalculationCancelled = false;');
-    source=source.replace('const fatalError = error instanceof Error ? error : new Error(String(error));',
-      'if (combatCalculationCancelled) throw error;\n            const fatalError = error instanceof Error ? error : new Error(String(error));');
-    source=source.replace('console.error("[Lab Clear Rate] manual update failed:", error);',
-      'if (combatCalculationCancelled) { setControlStatus({running:false,message:cancelledMessage()}); return; }\n            console.error("[Lab Clear Rate] manual update failed:", error);');
-    source=source.replace('function setControlStatus(status) {\n        const root = getControlPanel();',
-      'function setControlStatus(status) {\n        const root = getControlPanel();\n        if (root) CancelControls.sync(root, cancelCombatCalculation, status.running ?? manualUpdateRunning, isChineseUi());');
-    source=source.replace('function setAutomationEstimateControlStatus(status = {}) {\n        const root = document.getElementById(AUTOMATION_ESTIMATE_CONTROL_ID);',
-      'function setAutomationEstimateControlStatus(status = {}) {\n        const root = document.getElementById(AUTOMATION_ESTIMATE_CONTROL_ID);\n        if (root) CancelControls.sync(root, cancelCombatCalculation, status.running ?? automationEstimateRunning, isChineseUi());');
-    for (const mode of ['recommend', 'estimate']) {
-      source=source.replace(`console.error("[Lab Clear Rate] automation ${mode} failed:", error);`,
-        `if (combatCalculationCancelled) { automationEstimateStatusText = cancelledMessage(); break; }\n                    console.error("[Lab Clear Rate] automation ${mode} failed:", error);`);
-    }
-    // Cancel between rows as well as during the synchronous WASM call.
-    source=source.replaceAll('for (let i = 0; i < entries.length; i += 1) {\n                const entry = entries[i];',
-      'for (let i = 0; i < entries.length; i += 1) {\n                if (combatCalculationCancelled) break;\n                const entry = entries[i];');
-    source=source.replaceAll('message: automationEstimateStatusText,',
-      'message: combatCalculationCancelled ? cancelledMessage() : automationEstimateStatusText,');
+    // Keep busy/finished/error states, without calculation progress UI.
+    source=source.replace(/<div class="\$\{CONTROL_CLASS\}__progress">\n[\s\S]*?\n<\/div>\n/, '');
+    source=source.replace(/\.\$\{CONTROL_CLASS\}__(?:progress|track|bar|text) \{[^}]*\}\n/g, '');
+    source=source.replace('        const bar = root.querySelector(`.${CONTROL_CLASS}__bar`);\n', '');
+    source=source.replace(/        if \(bar && Object\.prototype\.hasOwnProperty\.call\(status, "ratio"\)\) \{[\s\S]*?\n        \}\n/, '');
+    source=source.replaceAll('t("calculatingProgressFmt", { current: i + 1, total: entries.length })', 't("calculating")');
+    source=source.replace(/t\("roomDistributionCalculatingFmt", \{\s*current: [^,]+,\s*total: [^,}]+,?\s*\}\)/g, 't("calculating")');
+    source=source.replace('const CONTROL_SCHEMA_VERSION = "7";', 'const CONTROL_SCHEMA_VERSION = "8";');
     source=source.replace('Combat Trials', 'Completed Battles per Room').replace('战斗次数', '每房间完成战斗场数');
-    source=source.replace('for (let targetPos = 0; targetPos < targetCount; targetPos += 1) {',
-      'for (let targetPos = 0; targetPos < targetCount; targetPos += 1) {\n            if (combatCalculationCancelled) throw new Error(cancelledMessage());');
-    source=source.replace('const doneMessage = buildLabyrinthCalcDoneMessage(state, flatRooms, targetIndexes);',
-      'if (combatCalculationCancelled) throw new Error(cancelledMessage());\n        const doneMessage = buildLabyrinthCalcDoneMessage(state, flatRooms, targetIndexes);');
-    source=source.replace('const ok = await updateRoomBadges(runOptions);',
-      'const ok = await updateRoomBadges(runOptions);\n            if (combatCalculationCancelled) throw new Error(cancelledMessage());');
     source=source.replace('            expectedSecondsPerClear,\n            combatMeta: {',
       '            expectedSecondsPerClear,\n            clearTimeInterval: workerResult.clearTimeInterval,\n            combatMeta: {');
-    source=source.replace('            failureReason: String(result?.combatMeta?.failureReason || ""),\n            abilities,',
-      '            failureReason: String(result?.combatMeta?.failureReason || ""),\n            clearTimeInterval: result?.clearTimeInterval,\n            abilities,');
-    source=source.replace('        appendRewardPreviewRows(tooltip, preview.rewardPreview);\n        appendPreviewRow(tooltip, t("operation"), t("rightClickOpenSimulator"));',
-      `        appendRewardPreviewRows(tooltip, preview.rewardPreview);
-        if (preview.clearTimeInterval) appendPreviewRow(tooltip,
-            isChineseUi() ? "通关耗时近似95%置信区间" : "Clear time approx. 95% CI",
-            ClearTimeIntervals.formatClearTimeInterval(preview.clearTimeInterval, isChineseUi() ? "zh" : "en"));
-        appendPreviewRow(tooltip, t("operation"), t("rightClickOpenSimulator"));`);
     source=source.replace('                            expectedSeconds,\n                            etaText,',
       '                            expectedSeconds,\n                            clearTimeInterval: result.clearTimeInterval,\n                            etaText,');
-    source=source.replace('return `ready:${roomLevel}:${chancePercent}:${etaText}`;',
-      'return `ready:${roomLevel}:${chancePercent}:${etaText}:${JSON.stringify(estimate.clearTimeInterval)}`;');
-    source=source.replace('        cell.appendChild(etaNode);', `        cell.appendChild(etaNode);
-        if (estimate.isCombat && estimate.clearTimeInterval) {
-            const ci = document.createElement("span");
-            ci.dataset.clearTimeCi = "";
-            ci.style.cssText = "display:block;font-size:10px;opacity:.85;white-space:normal";
-            ci.textContent = (isChineseUi() ? "近似95%区间 " : "Approx. 95% CI ") +
-                ClearTimeIntervals.formatClearTimeInterval(estimate.clearTimeInterval, isChineseUi() ? "zh" : "en");
-            cell.appendChild(ci);
-        }`);
     const begin=source.indexOf('    async function fetchCombatWorkerChunkText(');
     const end=source.indexOf('    function findRoomGridParent(',begin);
     source=source.slice(0,begin)+`
@@ -224,9 +187,7 @@ export async function buildCalculators() {
         return client.worker;
     }
     async function simulateCombatRoomWithWorker(params, progressTracker) {
-        if (combatCalculationCancelled) throw new Error(cancelledMessage());
         await ensureCombatSimulatorWorker();
-        if (combatCalculationCancelled) throw new Error(cancelledMessage());
         let completed = 0;
         const trials = Math.max(1, Math.floor(Number(params.trials) || 1));
         let targetTrials = trials;
@@ -236,12 +197,8 @@ export async function buildCalculators() {
             const next = Math.max(completed, Math.min(target, Math.floor(done)));
             if (progressTracker && next > completed) progressTracker.add(next - completed);
             completed = next;
-            if (automationEstimateRunning) setAutomationEstimateControlStatus({
-                running: true, message: completed + "/" + targetTrials + " " + t("combatTrials")
-            });
         };
         const result = await (params.progressive ? rustCalculator.runProgressive(params, advance) : rustCalculator.run(params, advance));
-        if (combatCalculationCancelled) throw new Error(cancelledMessage());
         if (completed !== targetTrials || result.completedTrials !== targetTrials) throw new Error("Rust 未完成请求场数");
         return result;
     }
