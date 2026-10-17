@@ -11,7 +11,6 @@ import {legacyFactorySource} from '../../comparison/legacy.mjs';
 const files=await buildCalculators();
 const root=new URL('../../',import.meta.url);
 const read=p=>fs.readFileSync(new URL(p,root));
-const upstream=read('comparison/tests/upstream-engine.wasm');
 const original=read('labyrinth-clear-rate.user.js').toString();
 const levels=[80,60,70,100,100,100,120,120,120,120];
 const game=fixtureGame();
@@ -33,15 +32,11 @@ const browser=await chromium.launch({headless:true,executablePath:'/Applications
 const output=new URL('../../comparison/tests/browser-results/',import.meta.url);
 fs.mkdirSync(output,{recursive:true});
 try {
-  for(const mode of ['embedded','remote']) {
+  for(const mode of ['embedded']) {
     const page=await browser.newPage({viewport:{width:1200,height:800},locale:'zh-CN'});
-    let requests=0,failDownload=false;
+    let requests=0;
     const errors=[];page.on('pageerror',e=>errors.push(e.message));
-    await page.route('https://wow121.github.io/mwi-fastsim/engine/mwi_engine.wasm',async route=>{
-      requests++;
-      await route.fulfill({status:failDownload?503:200,body:failDownload?'unavailable':upstream,
-        headers:{'Content-Type':'application/wasm','Access-Control-Allow-Origin':'*'}});
-    });
+    page.on('request',request=>{if(request.url().includes('mwi_engine.wasm'))requests++;});
     await page.goto(`http://127.0.0.1:${server.address().port}`);
     await page.evaluate(({state,maps})=>{
       window.fixtureState=state;localStorage.setItem('initClientData',JSON.stringify(maps));
@@ -52,16 +47,16 @@ try {
     const bootstrap=source.lastIndexOf('    migrateLegacySimulatorBridgeUrl();');
     source=source.slice(0,bootstrap)+`
     const realRun = rustCalculator.run;
-    rustCalculator.run = (params,progress) => realRun({...params,seed:12345},progress);
+    rustCalculator.run = (params,progress) => realRun({...params,seed:params.seed ?? 12345},progress);
     window.calculatorTest={computeCombatRoomClearChanceFullFlow,simulateCombatRoomWithWorker,
       buildMaxEnhancementByItem,buildCombatPlayerDtoForRoom,computeCombatRoomClearChance,resetCombatSimulatorWorker,
       findAutomationRecommendedLevelDelta,upsertAutomationRecommendCellContent,renderAutomationEstimateTooltip,
       getAutomationRoomTypeEntries,getAutomationRecommendFromCell,computeAutomationEntryClearChanceByRoomLevel,
-      resolveAutomationEffectiveLevel};
+      resolveAutomationEffectiveLevel,buildCombatPreview,renderCombatPreviewTooltip,upsertAutomationEstimateCellContent};
 `+source.slice(bootstrap);
     await page.addScriptTag({content:source});
     await page.waitForSelector('#mwi-lab-clear-rate-control');
-    assert.match(await page.locator('#mwi-lab-clear-rate-control').innerText(),mode==='embedded'?/Rust 内置修正版/:/Rust 远程上游版/);
+    assert.match(await page.locator('#mwi-lab-clear-rate-control').innerText(),/Rust 内置修正版/);
     const result=await page.evaluate(async()=>{
       const api=window.calculatorTest,state=window.fixtureState,maps=JSON.parse(localStorage.getItem('initClientData'));
       const rows=[];
@@ -75,10 +70,17 @@ try {
       return rows;
     });
     assert.equal(result.length,10);
-    assert.equal(requests,mode==='remote'?1:0,'engine downloads must be reused across rooms');
+    assert.equal(requests,0,'engine downloads must be reused across rooms');
     for(const row of result) {
       assert.ok(row.out.clearChance>=0 && row.out.clearChance<=1);
       assert.ok(row.out.combatMeta.firstRunDebug.elapsedMs>=0);
+      assert.equal(row.out.combatMeta.firstRunDebug.battleDurationLimitSeconds,120);
+      assert.equal(row.out.combatMeta.firstRunDebug.timeoutMode,'strict');
+      assert.ok(row.out.combatMeta.maxElapsedSeconds<=120);
+      assert.equal(row.out.clearTimeInterval.confidenceLevel,.95);
+      assert.equal(row.out.clearTimeInterval.method,row.out.combatMeta.successes===row.out.combatMeta.trials?'hoeffding-binomial':'fieller-t');
+      assert.ok((row.out.combatMeta.successes===0 ? ['no_success'] : ['bounded','unbounded']).includes(row.out.clearTimeInterval.status));
+      assert.deepEqual(row.out.combatMeta.clearTimeInterval,row.out.clearTimeInterval);
       assert.equal(row.out.combatMeta.firstRunDebug.engineMode,mode);
       assert.match(row.out.combatMeta.firstRunDebug.wasmSha256,/^[a-f0-9]{64}$/);
       const completedSeconds=row.out.combatMeta.firstRunDebug.fullCompletedSeconds;
@@ -87,6 +89,63 @@ try {
         assert.ok(Math.abs(row.out.expectedSecondsPerClear-completedSeconds/row.out.combatMeta.successes)<.001);
       } else assert.equal(row.out.expectedSecondsPerClear,Infinity);
     }
+    const ciDisplays=await page.evaluate(({room,out})=>{
+      const api=window.calculatorTest,state=window.fixtureState,maps=JSON.parse(localStorage.getItem('initClientData'));
+      const preview=api.buildCombatPreview(state,room,maps,out);
+      const ordinary=api.renderCombatPreviewTooltip(preview).textContent;
+      const cell=document.createElement('td');
+      api.upsertAutomationEstimateCellContent(cell,{status:'ready',isCombat:true,roomLevel:80,
+        clearChance:out.clearChance,expectedSeconds:out.expectedSecondsPerClear,etaText:'100 s',
+        clearTimeInterval:out.clearTimeInterval});
+      return {ordinary,inline:cell.querySelector('[data-clear-time-ci]')?.textContent};
+    },result[0]);
+    assert.match(ciDisplays.ordinary,/95%/);
+    assert.match(ciDisplays.inline,/95%/);
+    const progressive=await page.evaluate(async params=>{
+      const api=window.calculatorTest,rows=[],progress=[];
+      for(const trials of [300,1000,3000,1000]) {
+        let completed=0;
+        const out=await api.simulateCombatRoomWithWorker({...params,trials,progressive:true},
+          {add(n){completed+=n;progress.push({trials,completed});}});
+        rows.push(out);
+      }
+      const batches=[];
+      for(const batch of rows[2].firstRunDebug.batches) {
+        batches.push(await api.simulateCombatRoomWithWorker({...params,trials:batch.trials,seed:batch.seed}));
+      }
+      return {rows,progress,batches};
+    },{playerDto:result[0].input,monsterHrid:MONSTERS[0].hrid,mazeDifficulty:80,mazeCrateItemHrids:[]});
+    assert.deepEqual(progressive.rows.map(row=>row.trials),[300,1000,3000,3000]);
+    const cumulative=progressive.rows[2];
+    assert.deepEqual(cumulative.firstRunDebug.batches.map(row=>row.trials),[300,700,2000]);
+    assert.equal(new Set(cumulative.firstRunDebug.batches.map(row=>row.seed)).size,3);
+    assert.ok(progressive.progress.some(row=>row.trials===1000 && row.completed===300));
+    assert.ok(progressive.progress.some(row=>row.trials===3000 && row.completed===1000));
+    assert.equal(progressive.rows[3].sampleSource,'cache');
+    assert.deepEqual(progressive.rows[3].firstRunDebug,cumulative.firstRunDebug);
+    // Replay independent seeded batches through the actual Worker/WASM, and
+    // compare their additive statistics with the cumulative runtime result.
+    for(const key of ['trials','successes','failedByDeath','failedByTimeout','totalSpentSeconds',
+      'durationSquaredSeconds','successSpentSeconds']) {
+      const expected=progressive.batches.reduce((sum,row)=>sum+row[key],0);
+      assert.ok(Math.abs(cumulative[key]-expected)<1e-6,`cumulative WASM ${key}`);
+    }
+    const centered=progressive.batches.reduce((sum,row)=>sum+row.durationM2SecondsSquared+
+      row.trials*(row.durationMeanSeconds-cumulative.durationMeanSeconds)**2,0);
+    const comoment=progressive.batches.reduce((sum,row)=>sum+row.durationSuccessComomentSeconds+
+      row.trials*(row.durationMeanSeconds-cumulative.durationMeanSeconds)*(row.clearChance-cumulative.clearChance),0);
+    assert.ok(Math.abs(cumulative.durationM2SecondsSquared-centered)<1e-6);
+    assert.ok(Math.abs(cumulative.durationSuccessComomentSeconds-comoment)<1e-6);
+    const progressiveFacade=await page.evaluate(async()=>{
+      const api=window.calculatorTest,state=window.fixtureState,maps=JSON.parse(localStorage.getItem('initClientData'));
+      const room={...state.characterLabyrinth.roomData[0][0],recommendedLevel:82};
+      const rows=[];
+      for(const n of [2,5,3]) rows.push(await api.computeCombatRoomClearChance(state,maps,room,
+        api.buildMaxEnhancementByItem(state),null,n,'progressive-cache-test',{progressive:true}));
+      return rows;
+    });
+    assert.deepEqual(progressiveFacade.map(row=>row.combatMeta.trials),[2,5,5]);
+    assert.deepEqual(progressiveFacade[2].combatMeta.firstRunDebug.batches.map(row=>row.trials),[2,3]);
     if(mode==='embedded') {
       const stockSource=legacyFactorySource(original).replace('    getGameState,getInitClientData,',
         '    findAutomationRecommendedLevelDelta,computeAutomationEntryClearChanceByRoomLevel,getGameState,getInitClientData,');
@@ -103,13 +162,14 @@ try {
         }
         api.resetWorker();return rows;
       },{vendor,worker});
-      for(const [i,row] of result.entries()) {
-        assert.equal(row.out.clearChance,baseline[i].clearChance,`embedded win rate ${i}`);
-        for(const k of ['trials','successes','failedByDeath','failedByTimeout'])assert.equal(row.out.combatMeta[k],baseline[i].combatMeta[k],`${i}:${k}`);
-        // Expected time deliberately differs from the original last-success
-        // convention. Check each engine mode's completed-time quotient above;
-        // JS and Rust cutoff clocks can also differ for death-only rooms.
+      for(const row of result) {
+        assert.equal(row.out.combatMeta.trials,8);
+        assert.equal(row.out.combatMeta.completedTrials,8);
+        assert.ok(row.out.combatMeta.durationSquaredSeconds>0);
+        assert.ok(row.out.combatMeta.successSpentSeconds>=0);
       }
+      // The stock engine above remains a rule/time-budget diagnostic, not an
+      // exact-count oracle. Distribution comparisons are recorded separately.
       const recommendation=await page.evaluate(async()=>{
         const api=window.calculatorTest,state=window.fixtureState,maps=JSON.parse(localStorage.getItem('initClientData'));
         const match=await api.findAutomationRecommendedLevelDelta({state,initClientData:maps,
@@ -123,6 +183,7 @@ try {
       });
       assert.equal(recommendation.match.recommendationMethod,'weighted-isotonic');
       assert.equal(recommendation.match.budget,3000);
+      assert.equal(recommendation.match.result.combatMeta.completedTrials,3000);
       assert.equal(recommendation.match.result.combatMeta.firstRunDebug.requestedTrials,3000,'engine budget must not be clamped to the old limit');
       assert.ok(recommendation.match.fittedChance>=0 && recommendation.match.fittedChance<=1);
       assert.equal(recommendation.match.clearChance,recommendation.match.result.clearChance,'raw engine estimate must remain available');
@@ -138,22 +199,47 @@ try {
         const b=await api.computeAutomationEntryClearChanceByRoomLevel(params,78);
         return [a.result.combatMeta.source,b.result.combatMeta.source];
       });
-      assert.deepEqual(cacheSources,['full','full'],'recommendation verification must bypass old random-result caches');
+      assert.equal(cacheSources[1],'cache','recommendation reuses cumulative samples for the same configuration');
       fs.writeFileSync(new URL('calculator-recommendation.json',output),JSON.stringify(recommendation,null,2));
-    } else {
-      assert.ok(result.some(r=>r.out.combatMeta.firstRunDebug.reconstructionProbes>0),'upstream statistics must be reconstructed');
-      await page.evaluate(()=>window.calculatorTest.resetCombatSimulatorWorker());
-      failDownload=true;
-      const failure=await page.evaluate(async()=>{
-        try {await window.calculatorTest.simulateCombatRoomWithWorker({trials:1});return null;}
-        catch(e){return e.message;}
-      });
-      assert.match(failure,/503/);
-      failDownload=false;
-      const retry=await page.evaluate(async params=>window.calculatorTest.simulateCombatRoomWithWorker({...params,trials:1}),
-        {playerDto:result[0].input,monsterHrid:MONSTERS[0].hrid,mazeDifficulty:80,mazeCrateItemHrids:[]});
-      assert.ok(retry.trials>0);assert.equal(requests,3,'failed downloads must retry without silently changing engines');
     }
+    const cancellation=await page.evaluate(async params=>{
+      const api=window.calculatorTest;
+      let live=0;
+      try {
+        await api.simulateCombatRoomWithWorker({...params,trials:3000},{add(n){
+          live+=n;if(live>=30)api.resetCombatSimulatorWorker(new Error('测试取消'));
+        }});
+        return {cancelled:false,live};
+      } catch(error) {return {cancelled:/测试取消/.test(error.message),live};}
+    },{playerDto:result[0].input,monsterHrid:MONSTERS[0].hrid,mazeDifficulty:80,mazeCrateItemHrids:[]});
+    assert.equal(cancellation.cancelled,true);
+    assert.ok(cancellation.live>0 && cancellation.live<3000,'cancel while WASM is still running');
+    const afterCancel=await page.evaluate(async params=>window.calculatorTest.simulateCombatRoomWithWorker({...params,trials:3}),
+      {playerDto:result[0].input,monsterHrid:MONSTERS[0].hrid,mazeDifficulty:80,mazeCrateItemHrids:[]});
+    assert.equal(afterCancel.completedTrials,3,'cancelled Worker can be reinitialized');
+    const progressiveCancel=await page.evaluate(async params=>{
+      const api=window.calculatorTest;
+      await api.simulateCombatRoomWithWorker({...params,trials:6,progressive:true});
+      let done=0,cancelled=false;
+      try {
+        await api.simulateCombatRoomWithWorker({...params,trials:3000,progressive:true},
+          {add(n){done+=n;if(done>=30)api.resetCombatSimulatorWorker(new Error('累进测试取消'));}});
+      } catch(error) {cancelled=/累进测试取消/.test(error.message);}
+      const after=await api.simulateCombatRoomWithWorker({...params,trials:40,progressive:true});
+      return {cancelled,after};
+    },{playerDto:result[0].input,monsterHrid:MONSTERS[0].hrid,mazeDifficulty:81,mazeCrateItemHrids:[]});
+    assert.equal(progressiveCancel.cancelled,true);
+    assert.equal(progressiveCancel.after.trials,40);
+    assert.deepEqual(progressiveCancel.after.firstRunDebug.batches.map(row=>row.trials),[6,34]);
+    // Exercise the visible cancel control while an ordinary calculation is active.
+    await page.fill('#mwi-lab-clear-rate-control input[type=number]','3000');
+    await page.click('#mwi-lab-clear-rate-control button');
+    const cancelButton=page.locator('#mwi-lab-clear-rate-control [data-cancel-battles]');
+    await cancelButton.waitFor({state:'visible'});
+    await cancelButton.click();
+    await page.waitForFunction(()=>/已取消计算|Calculation cancelled/.test(
+      document.querySelector('#mwi-lab-clear-rate-control').textContent));
+    assert.equal(await page.locator('#mwi-lab-clear-rate-control button').first().isEnabled(),true);
     // Exercise the original real user flow, not only the calculation facade.
     await page.fill('#mwi-lab-clear-rate-control input[type=number]','1');
     await page.click('#mwi-lab-clear-rate-control button');
@@ -165,6 +251,14 @@ try {
       throw error;
     }
     assert.equal(await page.locator('.mwi-lab-clear-rate-badge').count(),10,'all rooms must receive the original overlay');
+    // Cancel during the inter-row animation frame when every combat result is cached.
+    await page.evaluate(()=>{
+      requestAnimationFrame(()=>document.querySelector('#mwi-lab-clear-rate-control [data-cancel-battles]').click());
+      document.querySelector('#mwi-lab-clear-rate-control .mwi-lab-clear-rate-control__button').click();
+    });
+    await page.waitForFunction(()=>/已取消计算|Calculation cancelled/.test(
+      document.querySelector('#mwi-lab-clear-rate-control').textContent));
+    assert.equal(await page.locator('#mwi-lab-clear-rate-control button').first().isEnabled(),true);
     if(mode==='embedded') {
       const productionBaseline=await page.evaluate(async()=>{
         const api=window.calculatorTest,state=window.fixtureState,maps=JSON.parse(localStorage.getItem('initClientData'));
@@ -200,6 +294,13 @@ try {
       assert.equal(await timeInput.inputValue(),'300');
       const winBox=await button.boundingBox(), timeBox=await timeButton.boundingBox();
       assert.ok(timeBox.y>winBox.y,'time and win targets must occupy separate Greasyfork-style rows');
+      await button.click();
+      const autoCancel=page.locator('#mwi-lab-auto-estimate-control [data-cancel-battles]');
+      await autoCancel.waitFor({state:'visible'});
+      await autoCancel.click();
+      await page.waitForFunction(()=>/已取消计算|Calculation cancelled/.test(
+        document.querySelector('.mwi-lab-auto-estimate-control__status').textContent));
+      await page.waitForFunction(()=>!document.querySelector('.mwi-lab-auto-estimate-control__recommend-button').disabled);
       await page.fill('.mwi-lab-auto-estimate-control__target-rate-input','70');
       await button.click();
       await page.waitForFunction(()=>{
@@ -225,8 +326,9 @@ try {
       await chart.waitFor({state:'visible'});
       const trace=await page.evaluate(()=>window.calculatorTest.getAutomationRecommendFromCell(
         document.querySelector('.mwi-lab-auto-recommend-cell[data-mwi-auto-room-key="shadow_archer"]')).recommendationChart);
-      assert.ok(trace.observations.length>trace.levelCount,'must retain replaced simulation rounds');
-      assert.deepEqual([...new Set(trace.observations.map(row=>row.budget))].sort((a,b)=>a-b),[300,1000,3000]);
+      assert.equal(trace.observations.length,trace.levelCount,'one cumulative point per level');
+      assert.equal(new Set(trace.observations.map(row=>row.roomLevel)).size,trace.levelCount);
+      assert.ok(trace.observations.every(row=>row.budget===row.trials && row.isLatest));
       const initialRange=await chart.locator('svg').getAttribute('data-level-range');
       const [initialLow,initialHigh]=initialRange.split(',').map(Number);
       assert.ok(initialLow<=trace.recommendedLevel && initialHigh>=trace.recommendedLevel,'default range includes recommendation');
@@ -350,10 +452,13 @@ try {
       assert.match(await chart.locator('h2').innerText(),/耗时|Time/);
       assert.equal(await chart.locator('[data-error-bar]').count(),0,'binomial win intervals must not be presented as time intervals');
       assert.match(await chart.innerText(),/305/);
-      assert.doesNotMatch(await chart.innerText(),/NaN|undefined|Wilson|置信区间/);
+      assert.doesNotMatch(await chart.innerText(),/NaN|undefined|Wilson/);
+      assert.match(await chart.innerText(),/95%/);
+      assert.ok(await chart.locator('[data-time-error-bar]').count()>0,'time chart must show paired clear-time intervals');
       const timedTrace=await page.evaluate(()=>window.calculatorTest.getAutomationRecommendFromCell(
         document.querySelector('.mwi-lab-auto-recommend-cell[data-mwi-auto-room-key="shadow_archer"]')).recommendationChart);
       assert.equal(timedTrace.basis,'seconds');
+      assert.ok(timedTrace.observations.every(row=>row.clearTimeInterval?.confidenceLevel===.95));
       assert.ok(timedTrace.curve.every((row,i,all)=>i===0 || row.fittedSeconds>=all[i-1].fittedSeconds));
       assert.ok(await chart.locator('[data-fit-curve]').getAttribute('d'));
       await page.screenshot({path:new URL('calculator-time-chart.png',output).pathname,fullPage:true});
@@ -374,7 +479,7 @@ try {
     await page.screenshot({path:new URL(`calculator-${mode}.png`,output).pathname,fullPage:true});
     assert.deepEqual(errors,[]);
     fs.writeFileSync(new URL(`calculator-${mode}.json`,output),JSON.stringify(result,null,2));
-    console.log(JSON.stringify({mode,monsters:10,downloadRequests:requests,checks:['real Worker/WASM','original calculator UI','progress','engine provenance',...(mode==='embedded'?['original parity','monotone recommendation','fresh verification','recommend button and hover']:['upstream statistics','download failure/retry'])]}));
+    console.log(JSON.stringify({mode,monsters:10,downloadRequests:requests,checks:['real Worker/WASM','original calculator UI','cumulative progress','engine provenance','exact battle counts','monotone recommendation','300/700/2000 batches and seed replay','cumulative cache','single point per level','recommend button and hover','cancellation and retained samples']}));
     await page.close();
   }
 } finally {await browser.close();server.close();}

@@ -5,9 +5,9 @@ const dec = new TextDecoder()
 
 export class WasmEngine {
   /** module: a WebAssembly.Module (or bytes) */
-  static async create(module) {
+  static async create(module, onProgress = () => {}) {
     const mod = module instanceof WebAssembly.Module ? module : await WebAssembly.compile(module)
-    const inst = await WebAssembly.instantiate(mod, {})
+    const inst = await WebAssembly.instantiate(mod, {env: {labyrinth_progress: onProgress}})
     return new WasmEngine(inst.exports)
   }
 

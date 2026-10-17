@@ -443,6 +443,7 @@ impl Unit {
     pub fn clear_buffs(&mut self) {
         self.combat_buffs.clear();
         self.candidates.clear();
+        self.next_cand = 0;
         let perms: Vec<PermBuff> = self.permanent.values().cloned().collect();
         for p in perms {
             let t = BuffTemplate {

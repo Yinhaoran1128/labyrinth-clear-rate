@@ -1,3 +1,4 @@
+import {formatClearTimeInterval} from './clear-time-interval.mjs';
 const ROOT_ID = 'mwi-lab-recommend-chart';
 const STYLE_ID = 'mwi-lab-recommend-chart-style';
 const NS = 'http://www.w3.org/2000/svg';
@@ -5,18 +6,18 @@ const COLORS = {300:'#a78bfa',1000:'#60a5fa',3000:'#fb7185'};
 const COPY = {
   zh: {title:'胜率—等级曲线',close:'关闭图表',level:'房间等级',win:'胜率',recommended:'推荐等级',
     fit:'单调拟合',raw:'模拟胜率',target:'目标',ci:'95% 置信区间',focus:'目标附近',reset:'全部范围',
-    all:'全部模拟记录',budget:'模拟预算',trials:'实际统计次数',wins:'成功数',round:'轮次',latest:'参与拟合',old:'历史轮次',
+    all:'全部等级记录',budget:'累计场数',trials:'累计完成场数',denominator:'胜率统计分母',wins:'成功数',round:'记录',latest:'参与拟合',old:'历史轮次',
     simulations:'次模拟',levels:'个等级',zoomIn:'放大',zoomOut:'缩小',help:'滚轮缩放 · 拖动平移 · 点击散点查看详情',
     hint:'点击查看胜率—等级图',keyboard:'回车或空格打开图表',
-    note:'误差棒为 95% Wilson 二项置信区间，按实际统计次数计算。连续战斗按独立对局近似；历史轮次全部保留，拟合仅使用每个等级的最新结果。',
-    tableHint:'可点击行定位对应散点；同一等级的多轮结果分别列出。'},
+    note:'误差棒为 95% Wilson 二项置信区间，按累计完成场数计算。对局按独立试验近似；每个等级仅显示累计场数最多的最新结果，并用于拟合。',
+    tableHint:'每个等级一条累计记录，可点击行定位对应散点。'},
   en: {title:'Win rate by level',close:'Close chart',level:'Room level',win:'Win rate',recommended:'Recommended level',
     fit:'Monotone fit',raw:'Simulated win rate',target:'Target',ci:'95% confidence interval',focus:'Near target',reset:'All levels',
-    all:'All simulation records',budget:'Simulation budget',trials:'Actual trial count',wins:'Wins',round:'Run',latest:'Used in fit',old:'Earlier run',
+    all:'All level records',budget:'Cumulative battles',trials:'Completed cumulative battles',denominator:'Win-rate denominator',wins:'Wins',round:'Record',latest:'Used in fit',old:'Earlier run',
     simulations:'runs',levels:'levels',zoomIn:'Zoom in',zoomOut:'Zoom out',help:'Scroll to zoom · Drag to pan · Select a point for details',
     hint:'View win rate by level',keyboard:'Enter or Space opens chart',
-    note:'Error bars show 95% Wilson binomial intervals using actual trial counts. Continuous battles are approximated as independent trials. Every run is retained; only the latest run at each level enters the fit.',
-    tableHint:'Select a row to locate its point. Repeated runs at the same level are listed separately.'},
+    note:'Error bars show 95% Wilson binomial intervals using cumulative completed counts. Battles are approximated as independent trials. Each level displays and fits its latest result with the largest cumulative count.',
+    tableHint:'One cumulative record per level. Select a row to locate its point.'},
 };
 const PRODUCTION_COPY = {
   zh: {fit:'公式计算',raw:'通关胜率',all:'全部等级记录',success:'操作成功率',double:'双倍进度率',
@@ -31,11 +32,11 @@ const PRODUCTION_COPY = {
 const percent = value => `${(value * 100).toFixed(1)}%`;
 const secondsText = value => Number.isFinite(value) ? `${value.toFixed(1)} s` : '∞';
 const TIME_COPY = {
-  zh: {title:'耗时—等级曲线',win:'预计通关耗时（秒）',raw:'预计通关耗时',
-    hint:'点击查看耗时—等级图',note:'预计通关耗时包含失败场次。耗时单调拟合按实际统计次数加权；每个等级仅使用最新轮次，历史轮次保留。∞ 表示本轮没有观察到通关；推荐拟合耗时最接近目标的等级，允许略超目标。',
+  zh: {title:'耗时—等级曲线',win:'预计通关耗时（秒）',raw:'预计通关耗时',ci:'原始耗时近似95%置信区间',
+    hint:'点击查看耗时—等级图',note:'预计通关耗时包含失败场次。耗时单调拟合按累计完成场数加权；每个等级仅显示并拟合累计场数最多的最新结果。误差棒为原始耗时的近似95% Fieller区间，包含耗时与成功的协方差；全胜时使用120秒有界均值与成功率的保守联合界。不是拟合曲线的置信带。样本不足或无成功时无法估计；成功数少时区间可能无界。超出纵轴的上界以箭头标示。推荐规则不变。',
     productionNote:'预计通关耗时包含失败场次，直接使用公式结果。取整产生的阶梯变化保留原值；∞ 表示无法通关。推荐耗时最接近目标的等级，允许略超目标。'},
-  en: {title:'Clear time by level',win:'Expected clear time (s)',raw:'Expected clear time',
-    hint:'View clear time by level',note:'Includes failed runs. The monotone time fit is weighted by actual trial counts using the latest run per level; earlier runs are retained. ∞ means no clear was observed. Recommends the closest fitted time, which may exceed the target.',
+  en: {title:'Clear time by level',win:'Expected clear time (s)',raw:'Expected clear time',ci:'Raw time approx. 95% CI',
+    hint:'View clear time by level',note:'Includes failed runs. The monotone time fit uses cumulative completed counts; each level displays and fits its latest result with the largest cumulative count. Bars show approximate 95% paired Fieller intervals for raw time, not confidence bands for the fit. All-win samples use conservative bounded-mean/binomial bounds with the 120s cap. Missing/no-success samples are unavailable; rare successes may give an unbounded interval. Arrows mark upper limits beyond the plot. Recommendation rules are unchanged.',
     productionNote:'Includes failed runs and uses formula results directly, preserving discrete steps. ∞ means unreachable. Recommends the closest time, which may exceed the target.'},
 };
 const intervalText = row => `${percent(row.confidenceInterval.lower)} – ${percent(row.confidenceInterval.upper)}`;
@@ -190,7 +191,7 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
       [t.success, percent(finalist.successChance)],[t.attempts, finalist.attempts]]
     : [[t.recommended, `Lv.${data.recommendedLevel}`],[t.fit, formatValue(fitted)],
       [t.raw, formatValue(rawValue(finalist))],
-      timeMode ? [COPY[language].win, percent(finalist.clearChance)] : [t.ci, intervalText(finalist)]];
+      timeMode ? [t.ci, formatClearTimeInterval(finalist.clearTimeInterval,language)] : [t.ci, intervalText(finalist)]];
   for (const [label,value] of cards) {
     const card = document.createElement('div');card.className='mwi-chart-card';
     const small = document.createElement('small'), strong = document.createElement('strong');
@@ -219,7 +220,7 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
     selected = row.id;
     root.querySelector('[data-point-detail]').textContent = production
       ? `Lv.${row.roomLevel} · ${productionDetails(row)}`
-      : `Lv.${row.roomLevel} · ${t.round} #${row.id} · ${t.budget} ${row.budget} · ${t.wins} ${row.successes}/${row.trials} · ${t.raw} ${formatValue(rawValue(row))}${timeMode ? '' : ` · ${t.ci} ${intervalText(row)}`} · ${row.isLatest?t.latest:t.old}`;
+      : `Lv.${row.roomLevel} · ${t.round} #${row.id} · ${t.budget} ${row.budget} · ${t.wins} ${row.successes} · ${t.trials} ${row.trials}${row.statisticalTrials !== undefined && row.statisticalTrials !== row.trials ? ` · ${t.denominator} ${row.statisticalTrials}` : ''} · ${t.raw} ${formatValue(rawValue(row))} · ${t.ci} ${timeMode ? formatClearTimeInterval(row.clearTimeInterval,language) : intervalText(row)} · ${row.isLatest?t.latest:t.old}`;
     for (const tr of root.querySelectorAll('tbody tr')) tr.dataset.selected = String(Number(tr.dataset.runId) === selected);
     for (const node of svg.querySelectorAll('[data-observation-id]')) {
       const active = Number(node.dataset.observationId) === selected;
@@ -285,18 +286,27 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
     layer.appendChild(svgNode('line',{x1:plot.left,x2:plot.width-plot.right,y1:y(target),y2:y(target),stroke:'#fbbf24','stroke-dasharray':'6 5',opacity:.8}));
     layer.appendChild(svgNode('line',{x1:x(data.recommendedLevel),x2:x(data.recommendedLevel),y1:plot.top,y2:plot.height-plot.bottom,stroke:'#fbbf24','stroke-dasharray':'3 5',opacity:.55}));
     for (const row of data.observations) {
-      if (production || timeMode) break;
+      if (production) break;
       if (!visibleBudgets.has(row.budget) || row.roomLevel<range[0] || row.roomLevel>range[1]) continue;
-      const cx=x(row.roomLevel),lower=y(row.confidenceInterval.lower),upper=y(row.confidenceInterval.upper);
-      const bar=svgNode('g',{'data-error-bar':row.id,stroke:color(row.budget),opacity:row.isLatest?.5:.23,'stroke-width':1.2});
-      for (const attributes of [{x1:cx,x2:cx,y1:upper,y2:lower},{x1:cx-3,x2:cx+3,y1:upper,y2:upper},{x1:cx-3,x2:cx+3,y1:lower,y2:lower}]) bar.appendChild(svgNode('line',attributes));
+      const interval=timeMode ? row.clearTimeInterval : row.confidenceInterval;
+      if (!interval || (timeMode && !['bounded','unbounded'].includes(interval.status))) continue;
+      const cx=x(row.roomLevel),lower=y(interval.lower),upper=y(interval.upper);
+      const bar=svgNode('g',{[timeMode?'data-time-error-bar':'data-error-bar']:row.id,
+        stroke:color(row.budget),opacity:row.isLatest?.55:.25,'stroke-width':1.2});
+      for (const attributes of [{x1:cx,x2:cx,y1:upper,y2:lower},
+        {x1:cx-3,x2:cx+3,y1:lower,y2:lower}]) bar.appendChild(svgNode('line',attributes));
+      if (timeMode && (!Number.isFinite(interval.upper) || interval.upper>yMax)) {
+        bar.appendChild(svgNode('path',{d:`M${cx-4},${upper+6} L${cx},${upper} L${cx+4},${upper+6}`,fill:'none'}));
+        bar.dataset.upperClipped='true';
+      } else bar.appendChild(svgNode('line',{x1:cx-3,x2:cx+3,y1:upper,y2:upper}));
+      if(timeMode)bar.appendChild(svgNode('title',{},formatClearTimeInterval(interval,language)));
       layer.appendChild(bar);
     }
     layer.appendChild(svgNode('path',{[production ? 'data-calculated-curve' : 'data-fit-curve']:'',d:curvePath,fill:'none',stroke:'#5eead4','stroke-width':2.5,'stroke-linejoin':'round','stroke-linecap':'round'}));
     for (const row of data.observations) {
       if ((!production && !visibleBudgets.has(row.budget)) || row.roomLevel<range[0] || row.roomLevel>range[1]) continue;
       const label = production ? `Lv.${row.roomLevel} · ${productionDetails(row)}`
-        : `Lv.${row.roomLevel}, ${t.round} ${row.id}, ${formatValue(rawValue(row))}${timeMode ? '' : `, ${t.ci} ${intervalText(row)}`}`;
+        : `Lv.${row.roomLevel}, ${t.round} ${row.id}, ${formatValue(rawValue(row))}, ${t.ci} ${timeMode ? formatClearTimeInterval(row.clearTimeInterval,language) : intervalText(row)}`;
       const point=svgNode('circle',{cx:x(row.roomLevel),cy:y(rawValue(row)),r:production?2.5:row.isLatest?4.5:3.3,fill:Number.isFinite(rawValue(row))?color(row.budget):'none',opacity:row.isLatest?1:.65,
         'data-observation-id':row.id,...(production?{}:{'data-budget':row.budget}),tabindex:0,role:'button','aria-label':label});
       point.appendChild(svgNode('title',{},label));
@@ -329,7 +339,7 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
   const enhancing = production && finalist.type === 'enhancing';
   const columns = production ? [t.level,t.raw,t.success,t.double,t.attempts,
     ...(enhancing ? [t.enhancingTarget] : [t.progress,t.targetProgress,t.needed])]
-    : [t.round,t.level,t.budget,t.wins,t.trials,t.raw,...(timeMode?[]:[t.ci]),t.fit];
+    : [t.round,t.level,t.budget,t.wins,t.trials,t.denominator,t.raw,t.ci,t.fit];
   for(const label of columns) {
     const th=document.createElement('th');th.textContent=label;head.appendChild(th);
   }
@@ -338,8 +348,8 @@ export function show({title, data, locale = 'en', returnFocus = document.activeE
     const tr=document.createElement('tr');tr.tabIndex=0;tr.dataset.runId=row.id;
     const values = production ? [row.roomLevel,formatValue(rawValue(row)),percent(row.successChance),percent(row.doubleChance),row.attempts,
       ...(enhancing ? [`+${row.targetLevel}`] : [row.progressPerSuccess,row.targetProgress,unitsText(row.neededUnits)])]
-      : [`#${row.id}`,row.roomLevel,row.budget,row.successes,row.trials,formatValue(rawValue(row)),
-        ...(timeMode?[]:[intervalText(row)]),row.isLatest?formatValue(fittedByLevel.get(row.roomLevel)):t.old];
+      : [`#${row.id}`,row.roomLevel,row.budget,row.successes,row.trials,row.statisticalTrials ?? row.trials,formatValue(rawValue(row)),
+        timeMode?formatClearTimeInterval(row.clearTimeInterval,language):intervalText(row),row.isLatest?formatValue(fittedByLevel.get(row.roomLevel)):t.old];
     for(const value of values) {
       const td=document.createElement('td');td.textContent=String(value);tr.appendChild(td);
     }

@@ -86,3 +86,33 @@ test('failed and stopped computations keep their elapsed time; unattempted rows 
     {legacy:{elapsedMs:1,error:'skipped',attempted:false}}]),
     {legacyMs:180000,rustMs:500,legacyCount:1,rustCount:1});
 });
+
+test('completed-battle simultaneous death counts only as success',()=>{
+  const result=summarizeResult({deaths:{player1:1},labyrinthStats:{completedTrials:1,successes:1,
+    failedByDeath:0,failedByTimeout:0,completedSpentNs:30e9,totalSpentSeconds:30,
+    durationSquaredSeconds:900,successSpentSeconds:30,durationMeanSeconds:30,
+    durationM2SecondsSquared:0,durationSuccessComomentSeconds:0}},'completed');
+  assert.equal(result.trials,1);
+  assert.equal(result.completedTrials,1);
+  assert.equal(result.statisticalTrials,1);
+  assert.equal(result.failures,0);
+  assert.equal(result.clearChance,1);
+  assert.equal(result.failedByDeath,0);
+  assert.equal(result.terminalDeaths,0);
+  assert.equal(result.totalSpentSeconds,30);
+  assert.equal(result.durationSquaredSeconds,900);
+  assert.equal(result.successSpentSeconds,30);
+});
+
+test('completed-battle simultaneous victories never add deaths to failures or displace timeouts',()=>{
+  const result=summarizeResult({deaths:{player1:3},labyrinthStats:{completedTrials:4,successes:2,
+    failedByDeath:1,failedByTimeout:1,completedSpentNs:200e9}},'completed');
+  assert.equal(result.trials,4);
+  assert.equal(result.statisticalTrials,4);
+  assert.equal(result.successes,2);
+  assert.equal(result.failedByDeath,1);
+  assert.equal(result.failedByTimeout,1);
+  assert.equal(result.failures,2);
+  assert.equal(result.clearChance,.5);
+  assert.equal(result.expectedSecondsPerClear,100);
+});

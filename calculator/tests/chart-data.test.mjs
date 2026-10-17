@@ -27,20 +27,37 @@ test('invalid statistical denominators cannot produce misleading error bars', ()
   assert.throws(() => interval(.7, NaN), /统计/);
   assert.throws(() => interval(1.1, 100), /胜率/);
 });
-test('trace records all rounds but fits only the latest round per level', () => {
+test('trace displays only the largest cumulative result per level, latest on equal counts', () => {
   const history = [
     {id:1,roomLevel:100,budget:30,trials:40,successes:20,clearChance:.5},
     {id:2,roomLevel:110,budget:30,trials:100,successes:40,clearChance:.4},
     {id:3,roomLevel:100,budget:300,trials:400,successes:280,clearChance:.7},
+    {id:4,roomLevel:100,budget:30,trials:40,successes:20,clearChance:.5},
+    {id:5,roomLevel:110,budget:100,trials:100,successes:45,clearChance:.45},
   ];
   const fit = [{roomLevel:100,fittedChance:.7},{roomLevel:110,fittedChance:.4}];
   const out = createRecommendationChartData({history,fit,targetChance:.7,recommendedLevel:100});
-  assert.equal(out.observations.length, 3);
-  assert.deepEqual(out.observations.map(x => x.isLatest), [false,true,true]);
-  assert.ok(out.observations[0].confidenceInterval.lower < .5);
-  assert.ok(out.observations[0].confidenceInterval.upper > .5);
-  assert.ok(out.observations[2].confidenceInterval.upper < .75);
+  assert.equal(out.observations.length, 2);
+  assert.deepEqual(out.observations.map(x => x.id), [3,5]);
+  assert.ok(out.observations.every(x => x.isLatest));
+  assert.ok(out.observations[0].confidenceInterval.lower < .7);
+  assert.ok(out.observations[0].confidenceInterval.upper < .75);
   assert.deepEqual(out.curve, fit);
   assert.equal(out.levelCount, 2);
   assert.equal(history[0].isLatest, undefined);
+});
+
+test('time trace computes pointwise clear-time intervals from retained moments without changing the fit',()=>{
+  const history=[{id:1,roomLevel:100,budget:100,trials:100,successes:50,clearChance:.5,
+    expectedSecondsPerClear:50,totalSpentSeconds:2500,durationSquaredSeconds:75000,successSpentSeconds:750,
+    durationM2SecondsSquared:12500,durationSuccessComomentSeconds:-500},
+    {id:2,roomLevel:101,budget:100,trials:100,successes:0,clearChance:0,expectedSecondsPerClear:Infinity,
+      totalSpentSeconds:12000,durationSquaredSeconds:1440000,successSpentSeconds:0,
+      durationM2SecondsSquared:0,durationSuccessComomentSeconds:0}];
+  const fit=[{roomLevel:100,fittedSeconds:50},{roomLevel:101,fittedSeconds:Infinity}];
+  const out=createRecommendationChartData({history,fit,targetSeconds:60,recommendedLevel:100});
+  assert.equal(out.observations[0].clearTimeInterval?.status,'bounded');
+  assert.equal(out.observations[1].clearTimeInterval?.status,'no_success');
+  assert.equal(out.observations[0].confidenceInterval,undefined);
+  assert.deepEqual(out.curve,fit);
 });

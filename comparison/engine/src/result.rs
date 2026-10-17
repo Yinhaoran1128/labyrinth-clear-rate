@@ -25,6 +25,18 @@ pub struct OutOfMana {
     pub total: f64,
 }
 
+/// Compensated sums avoid losing small durations when many encounters are accumulated.
+#[derive(Default)]
+struct StableSum { sum: f64, correction: f64 }
+impl StableSum {
+    fn add(&mut self, x: f64) {
+        let y = x - self.correction;
+        let t = self.sum + y;
+        self.correction = (t - self.sum) - y;
+        self.sum = t;
+    }
+}
+
 #[derive(Default)]
 pub struct LabyrinthStats {
     pub completed_trials: u64,
@@ -32,6 +44,39 @@ pub struct LabyrinthStats {
     pub failed_by_death: u64,
     pub failed_by_timeout: u64,
     pub completed_spent_ns: f64,
+    total_seconds: StableSum,
+    squared_seconds: StableSum,
+    success_seconds: StableSum,
+    pub duration_mean_seconds: f64,
+    pub duration_m2_seconds_squared: f64,
+    pub duration_success_comoment_seconds: f64,
+    pub min_elapsed_seconds: f64,
+    pub max_elapsed_seconds: f64,
+}
+
+impl LabyrinthStats {
+    pub fn record(&mut self, elapsed_ns: f64, success: bool, dead: bool) {
+        let x = elapsed_ns / 1e9;
+        let old_success_mean = if self.completed_trials == 0 { 0.0 }
+            else { self.successes as f64 / self.completed_trials as f64 };
+        self.completed_trials += 1;
+        if success { self.successes += 1; }
+        else if dead { self.failed_by_death += 1; }
+        else { self.failed_by_timeout += 1; }
+        self.total_seconds.add(x);
+        self.squared_seconds.add(x * x);
+        if success { self.success_seconds.add(x); }
+        self.completed_spent_ns = self.total_seconds.sum * 1e9;
+        let delta = x - self.duration_mean_seconds;
+        self.duration_mean_seconds += delta / self.completed_trials as f64;
+        self.duration_m2_seconds_squared += delta * (x - self.duration_mean_seconds);
+        // Online paired Welford: sum((duration-mean_duration)*(success-mean_success)).
+        let success_mean = old_success_mean + ((if success { 1.0 } else { 0.0 }) - old_success_mean)
+            / self.completed_trials as f64;
+        self.duration_success_comoment_seconds += delta * ((if success { 1.0 } else { 0.0 }) - success_mean);
+        if self.completed_trials == 1 || x < self.min_elapsed_seconds { self.min_elapsed_seconds = x; }
+        self.max_elapsed_seconds = self.max_elapsed_seconds.max(x);
+    }
 }
 
 pub struct SimResult {
@@ -389,6 +434,14 @@ impl SimResult {
                 "failedByDeath": s.failed_by_death,
                 "failedByTimeout": s.failed_by_timeout,
                 "completedSpentNs": n(s.completed_spent_ns),
+                "totalSpentSeconds": n(s.total_seconds.sum),
+                "durationSquaredSeconds": n(s.squared_seconds.sum),
+                "successSpentSeconds": n(s.success_seconds.sum),
+                "durationMeanSeconds": n(s.duration_mean_seconds),
+                "durationM2SecondsSquared": n(s.duration_m2_seconds_squared),
+                "durationSuccessComomentSeconds": n(s.duration_success_comoment_seconds),
+                "minElapsedSeconds": n(s.min_elapsed_seconds),
+                "maxElapsedSeconds": n(s.max_elapsed_seconds),
             }));
         }
         Value::Object(o)
@@ -420,4 +473,31 @@ fn nested(m: &IndexMap<(u32, u32), f64>, names: &Interner) -> Value {
             .insert(names.name(*b).to_string(), json_num(*v));
     }
     Value::Object(out)
+}
+
+#[cfg(test)]
+mod labyrinth_statistics_tests {
+    use super::*;
+    #[test]
+    fn completed_duration_moments_and_success_covariance() {
+        let mut s = LabyrinthStats::default();
+        for (seconds, win, dead) in [(2.0,true,false),(4.0,false,true),(6.0,false,false),(8.0,true,true)] {
+            s.record(seconds*1e9,win,dead);
+        }
+        assert_eq!((s.completed_trials,s.successes,s.failed_by_death,s.failed_by_timeout),(4,2,1,1));
+        assert_eq!(s.total_seconds.sum,20.0);
+        assert_eq!(s.squared_seconds.sum,120.0);
+        assert_eq!(s.success_seconds.sum,10.0);
+        assert_eq!(s.duration_mean_seconds,5.0);
+        assert_eq!(s.duration_m2_seconds_squared,20.0);
+        assert_eq!(s.duration_success_comoment_seconds,0.0);
+        assert_eq!((s.min_elapsed_seconds,s.max_elapsed_seconds),(2.0,8.0));
+    }
+    #[test]
+    fn compensated_sum_retains_small_additions() {
+        let mut sum=StableSum::default();
+        sum.add(1e16);
+        for _ in 0..1000 { sum.add(1.0); }
+        assert_eq!(sum.sum,1e16+1000.0);
+    }
 }

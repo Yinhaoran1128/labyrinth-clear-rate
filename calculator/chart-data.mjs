@@ -1,3 +1,5 @@
+import {clearTimeInterval} from './clear-time-interval.mjs';
+
 // Two-sided 95% Wilson score interval for a binomial proportion.
 // n follows the calculator's actual statistical denominator. Continuous-battle
 // dependence is not modeled: this is an independent-trial binomial approximation.
@@ -16,12 +18,17 @@ export function binomialWinRateInterval(p, n) {
 
 export function createRecommendationChartData({history, fit, targetChance, targetSeconds, recommendedLevel}) {
   const timeMode = targetSeconds !== undefined;
-  const lastByLevel = new Map(history.map(row => [row.roomLevel, row.id]));
+  const lastByLevel = new Map();
+  for (const row of history) {
+    const previous = lastByLevel.get(row.roomLevel);
+    if (!previous || row.trials >= previous.trials) lastByLevel.set(row.roomLevel, row);
+  }
   return {
     basis: timeMode ? 'seconds' : 'winRate', targetSeconds,
     targetChance, recommendedLevel, levelCount: lastByLevel.size,
-    observations: history.map(row => ({...row,
-      isLatest: lastByLevel.get(row.roomLevel) === row.id,
+    observations: [...lastByLevel.values()].sort((a, b) => a.id - b.id).map(row => ({...row,
+      budget: row.trials, isLatest: true,
+      clearTimeInterval: clearTimeInterval(row),
       ...(timeMode ? {} : {confidenceInterval: binomialWinRateInterval(row.clearChance, row.trials)}),
     })),
     curve: fit.map(row => ({roomLevel: row.roomLevel,

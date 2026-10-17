@@ -42,7 +42,7 @@ try {
   await page.fill('#mwi-compare-level','50');await page.click('[data-action=apply]');
   assert.equal(await page.locator('[data-level="9"]').inputValue(),'50');
   await page.fill('#mwi-compare-trials','0');await page.click('[data-action=run]');
-  assert.match(await page.locator('#mwi-compare-status').innerText(),/1～2000/);
+  assert.match(await page.locator('#mwi-compare-status').innerText(),/1～3000/);
   await page.fill('#mwi-compare-trials','3');await page.check('#mwi-compare-fixed');
   for(const [i,level] of levels.entries()){
     await page.fill(`[data-level="${i}"]`,String(level));await page.locator(`[data-level="${i}"]`).blur();

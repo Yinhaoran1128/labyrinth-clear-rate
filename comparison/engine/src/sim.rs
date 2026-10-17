@@ -21,6 +21,7 @@ const ENEMY_RESPAWN: f64 = 3.0 * X;
 const PLAYER_RESPAWN: f64 = 150.0 * X;
 const DUNGEON_RESTART: f64 = 3.0 * X;
 const ENRAGE_TICK: f64 = 60.0 * X;
+const LABYRINTH_DURATION: f64 = 120.0 * X;
 
 pub type SimErr = String;
 
@@ -185,6 +186,8 @@ enum Val {
 }
 
 pub struct Sim<'a> {
+    labyrinth_trials: Option<u64>,
+    legacy_labyrinth_timeout: bool,
     fixed_labyrinth_cooldowns: bool,
     legacy_labyrinth_fury: bool,
     labyrinth_current_start: Option<f64>,
@@ -277,6 +280,15 @@ impl<'a> Sim<'a> {
             .and_then(|p| p.as_array())
             .ok_or("scenario has no players")?;
         let seed = sc.get("seed").map(to_num).unwrap_or(0.0);
+        let labyrinth_trials = match sc.get("labyrinthTrials") {
+            None => None,
+            Some(v) => {
+                let n = v.as_u64().filter(|&n| n > 0 && n <= 3000)
+                    .ok_or("labyrinthTrials must be an integer from 1 to 3000")?;
+                if lab.is_none() { return Err("labyrinthTrials requires labyrinth mode".into()); }
+                Some(n)
+            }
+        };
         let res = SimResult::new(
             zone.as_ref().map(|z| (z.hrid.clone(), z.tier)),
             lab.as_ref().map(|l| (l.monster_hrid.clone(), l.room_level)),
@@ -289,6 +301,9 @@ impl<'a> Sim<'a> {
             .map(|n| it.id(n))
             .collect();
         let mut sim = Sim {
+            labyrinth_trials,
+            // Only the independent comparison opts into the pinned old rule.
+            legacy_labyrinth_timeout: labyrinth_trials.is_none() && sc.get("labyrinthLegacyTimeout").and_then(Value::as_bool).unwrap_or(false),
             fixed_labyrinth_cooldowns: sc.get("labyrinthFixedMonsterCooldown").and_then(Value::as_bool).unwrap_or(false),
             legacy_labyrinth_fury: lab.is_some() && sc.get("labyrinthLegacyFury").and_then(Value::as_bool).unwrap_or(false),
             labyrinth_current_start: None,
@@ -531,30 +546,69 @@ impl<'a> Sim<'a> {
     }
 
     pub fn simulate(&mut self, limit: f64) -> Result<(), SimErr> {
+        self.simulate_with_progress(limit, |_, _| {})
+    }
+
+    pub fn simulate_with_progress(&mut self, limit: f64, mut progress: impl FnMut(u64, u64)) -> Result<(), SimErr> {
         self.q.clear();
         self.time = 0.0;
         self.temp_dungeon_count = 0.0;
         self.q.add(0.0, Ev::CombatStart);
         let mut same_time = 0u64;
-        while self.time < limit {
-            let e = self.q.pop().ok_or("event queue empty")?;
-            if e.time == self.time {
-                same_time += 1;
-                // e.g. a weapon with attackInterval 0: the original engine loops forever here
-                if same_time > 2_000_000 {
-                    return Err("simulation stalled (time does not advance)".into());
+        let mut reported = 0;
+        while self.labyrinth_trials.map_or(self.time < limit || self.finishing_deadline_at_limit(limit),
+            |n| self.res.labyrinth_stats.completed_trials < n) {
+            self.process_next_event(&mut same_time)?;
+            if let Some(n) = self.labyrinth_trials {
+                let completed = self.res.labyrinth_stats.completed_trials;
+                // At most ~100 progress messages per call, including the final full battle.
+                if completed == n || completed >= reported + (n / 100).max(1) {
+                    progress(completed, n);
+                    reported = completed;
                 }
-            } else {
-                same_time = 0;
             }
-            self.time = e.time;
-            self.process(e.ev)?;
-            if let Some(err) = self.res.error.take() {
-                return Err(err);
-            }
-            self.events_processed += 1;
         }
         self.finish();
+        Ok(())
+    }
+
+    fn finishing_deadline_at_limit(&self, limit: f64) -> bool {
+        // A strict time-budget caller may reach its budget on a nonterminal
+        // deadline event. Drain that timestamp and settle the battle before
+        // exiting; a terminal battle clears current_start, so N+1 is not begun.
+        !self.legacy_labyrinth_timeout && self.time <= limit &&
+            self.labyrinth_current_start.map_or(false, |start| self.time == start + LABYRINTH_DURATION)
+    }
+
+    fn process_next_event(&mut self, same_time: &mut u64) -> Result<(), SimErr> {
+        let next = self.q.pop();
+        if !self.legacy_labyrinth_timeout {
+            if let Some(start) = self.labyrinth_current_start {
+                let deadline = start + LABYRINTH_DURATION;
+                // There is no timeout event competing with combat events at the
+                // same timestamp. Process every event <= deadline in queue order,
+                // including events newly scheduled at the deadline, before timing out.
+                if next.as_ref().map_or(true, |event| event.time > deadline) {
+                    self.time = deadline;
+                    *same_time = 0;
+                    self.finish_labyrinth_encounter(false, false);
+                    return Ok(());
+                }
+            }
+        }
+        let event = next.ok_or("event queue empty")?;
+        if event.time == self.time {
+            *same_time += 1;
+            if *same_time > 2_000_000 {
+                return Err("simulation stalled (time does not advance)".into());
+            }
+        } else {
+            *same_time = 0;
+        }
+        self.time = event.time;
+        self.process(event.ev)?;
+        if let Some(err) = self.res.error.take() { return Err(err); }
+        self.events_processed += 1;
         Ok(())
     }
 
@@ -654,6 +708,9 @@ impl<'a> Sim<'a> {
             Ev::AwaitCooldown { source } => self.add_next_attack(source)?,
             Ev::CooldownReady => {}
         }
+        if self.labyrinth_trials.is_some() && self.labyrinth_current_start.is_none() {
+            return Ok(());
+        }
         self.check_triggers()
     }
 
@@ -666,6 +723,10 @@ impl<'a> Sim<'a> {
             let p = self.players[i];
             let rng = &mut self.rng;
             self.units[p].reset(t, rng);
+            if self.lab.is_some() {
+                if self.labyrinth_trials.is_some() { self.units[p].out_of_mana = false; }
+                self.res.add_ran_out_of_mana(self.units[p].hid, false, self.time);
+            }
         }
         self.q.add(self.time + REGEN_TICK, Ev::RegenTick);
         self.start_new_encounter()
@@ -725,6 +786,9 @@ impl<'a> Sim<'a> {
             }
         }
         if self.lab.is_some() {
+            // Old encounter events were cleared at its terminal boundary. Reuse the
+            // player units, templates and parsed data; discard obsolete monster state.
+            self.units.truncate(self.players.len());
             let (h, rl) = {
                 let l = self.lab.as_ref().unwrap();
                 (l.monster_hrid.clone(), l.room_level)
@@ -1321,23 +1385,23 @@ impl<'a> Sim<'a> {
             self.all_dead = true;
         }
         if let Some(lab) = &self.lab {
-            if self.time - lab.encounter_start > 120.0 * 1e9 || e {
-                self.enemies = None;
+            if (self.legacy_labyrinth_timeout && self.time - lab.encounter_start > LABYRINTH_DURATION) || e {
                 e = true;
-                self.q.clear();
-                self.q.add(self.time, Ev::CombatStart);
+                self.finish_labyrinth_encounter(self.res.encounters > before_encounters, self.all_dead);
             }
         }
-        if e && self.lab.is_some() {
-            let start = self.labyrinth_current_start.take().unwrap_or(self.time);
-            let s = &mut self.res.labyrinth_stats;
-            s.completed_trials += 1;
-            s.completed_spent_ns += (self.time - start).max(0.0);
-            if self.res.encounters > before_encounters { s.successes += 1; }
-            else if self.all_dead { s.failed_by_death += 1; }
-            else { s.failed_by_timeout += 1; }
-        }
         Ok(e)
+    }
+
+    fn finish_labyrinth_encounter(&mut self, success: bool, dead: bool) {
+        let start = self.labyrinth_current_start.take().unwrap_or(self.time);
+        self.enemies = None;
+        self.q.clear();
+        self.all_dead = dead;
+        self.res.labyrinth_stats.record((self.time - start).max(0.0), success, dead);
+        if self.labyrinth_trials.map_or(true, |n| self.res.labyrinth_stats.completed_trials < n) {
+            self.q.add(self.time, Ev::CombatStart);
+        }
     }
 
     fn add_experience(&mut self, p: UnitId, t: f64) {
@@ -2463,6 +2527,188 @@ fn calc_tick(e: f64, t: f64, i: f64) -> f64 {
 mod compatibility_tests {
     use super::*;
     use serde_json::json;
+
+    fn reset_fixture() -> (GameData, Value) {
+        let gd=GameData::from_json(&json!({
+            "abilities": {}, "abilityAliases": {}, "combatStyles": {}, "triggerDependencies": {},
+            "monsters": {"dummy": {"experience": 0, "enrageTime": 60e9,"abilities": [],
+                "combatDetails": {"attackInterval": 3e9,"staminaLevel": 10,"intelligenceLevel": 10,
+                    "attackLevel": 10,"meleeLevel": 10,"defenseLevel": 10,"rangedLevel": 10,"magicLevel": 10,
+                    "combatStats": {"combatStyleHrids": ["/combat_styles/stab"],"damageType": "/damage_types/physical"}}}}
+        })).unwrap();
+        let sc=json!({"seed": 7,"labyrinthTrials": 2,"labyrinthFixedMonsterCooldown": true,
+            "labyrinth": {"monsterHrid": "dummy","roomLevel": 100},
+            "players": [{"hrid":"player1","levels":[100,100,100,100,100,100,100],
+                "equipStats":{},"combatStyleHrid":"/combat_styles/stab","damageType":"/damage_types/physical",
+                "attackInterval":3e9,"debuffOnLevelGap":0,"abilities":[],"food":[],"drinks":[]}]});
+        (gd,sc)
+    }
+
+    #[test]
+    fn strict_deadline_processes_wins_and_deaths_before_or_at_120_but_never_after() {
+        for start in [0.0, 37e9] {
+            for elapsed in [120e9-1000.0, 120e9, 120e9+1000.0] {
+                for player_dies in [false,true] {
+                    let (gd,mut sc)=reset_fixture();
+                    sc["labyrinthTrials"]=json!(1);
+                    let mut sim=Sim::new(&gd,&sc,false).unwrap();
+                    sim.time=start;
+                    sim.on_combat_start().unwrap();
+                    let monster=sim.enemies.as_ref().unwrap()[0];
+                    let target=if player_dies {0} else {monster};
+                    let hp=sim.units[target].d.hp;
+                    sim.q.clear();
+                    sim.q.add(start+elapsed,Ev::Dot {source_ref:if player_dies {monster} else {0},
+                        target,damage:hp,total:1.0,current:1.0});
+                    sim.process_next_event(&mut 0).unwrap();
+                    let stats=&sim.res.labyrinth_stats;
+                    assert_eq!(stats.completed_trials,1);
+                    assert_eq!(sim.time,start+elapsed.min(120e9));
+                    assert_eq!(stats.completed_spent_ns,elapsed.min(120e9));
+                    let late=elapsed>120e9;
+                    assert_eq!(stats.successes,if !late && !player_dies {1} else {0});
+                    assert_eq!(stats.failed_by_death,if !late && player_dies {1} else {0});
+                    assert_eq!(stats.failed_by_timeout,if late {1} else {0});
+                    assert_eq!(sim.events_processed,if late {0} else {1});
+                    if late { assert_eq!(sim.units[target].d.hp,hp); }
+                    assert_eq!(sim.q.len(),0,"must not schedule N+1");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deadline_waits_for_all_events_at_120_and_handles_an_empty_queue() {
+        let (gd,mut sc)=reset_fixture();sc["labyrinthTrials"]=json!(1);
+        let mut sim=Sim::new(&gd,&sc,false).unwrap();sim.on_combat_start().unwrap();
+        let monster=sim.enemies.as_ref().unwrap()[0];
+        let hp=sim.units[monster].d.hp;
+        sim.q.clear();
+        sim.q.add(120e9,Ev::CooldownReady);
+        sim.q.add(120e9,Ev::Dot {source_ref:0,target:monster,damage:hp,total:1.0,current:1.0});
+        sim.process_next_event(&mut 0).unwrap();
+        assert_eq!(sim.res.labyrinth_stats.completed_trials,0);
+        sim.process_next_event(&mut 0).unwrap();
+        assert_eq!(sim.res.labyrinth_stats.successes,1);
+        assert_eq!(sim.res.labyrinth_stats.completed_spent_ns,120e9);
+        // No queued event is needed to finish a live battle at its deadline.
+        let mut idle=Sim::new(&gd,&sc,false).unwrap();idle.on_combat_start().unwrap();idle.q.clear();
+        idle.process_next_event(&mut 0).unwrap();
+        assert_eq!(idle.res.labyrinth_stats.failed_by_timeout,1);
+        assert_eq!(idle.time,120e9);
+    }
+
+    #[test]
+    fn event_at_deadline_can_schedule_another_event_at_the_same_timestamp() {
+        let (gd,mut sc)=reset_fixture();sc["labyrinthTrials"]=json!(1);
+        let mut sim=Sim::new(&gd,&sc,false).unwrap();sim.on_combat_start().unwrap();sim.q.clear();
+        let def=Rc::new(AbilityDef {hrid:Rc::from("instant"),hid:0,mana_cost:0.0,cooldown:20e9,
+            cast:0.0,is_special:false,effects:vec![],default_triggers:vec![]});
+        sim.units[0].abilities.push(Some(Ability {def,triggers:Rc::new(vec![]),last_used:MIN_SAFE_INTEGER}));
+        sim.q.add(120e9,Ev::StunExp {source:0});
+        sim.process_next_event(&mut 0).unwrap();
+        assert!(sim.q.any(|ev| matches!(ev,Ev::CastEnd {..})));
+        sim.process_next_event(&mut 0).unwrap();
+        assert_eq!(sim.units[0].abilities.last().unwrap().as_ref().unwrap().last_used,120e9);
+        assert_eq!(sim.res.labyrinth_stats.completed_trials,0);
+        sim.process_next_event(&mut 0).unwrap();
+        assert_eq!(sim.res.labyrinth_stats.failed_by_timeout,1);
+        assert_eq!(sim.res.labyrinth_stats.completed_spent_ns,120e9);
+        assert_eq!(sim.events_processed,2,"only the expiry and its instant cast run");
+    }
+
+    #[test]
+    fn discarded_late_events_do_not_consume_rng_or_change_unit_state() {
+        let (gd,mut sc)=reset_fixture();sc["labyrinthTrials"]=json!(1);
+        let mut sim=Sim::new(&gd,&sc,false).unwrap();sim.on_combat_start().unwrap();sim.q.clear();
+        let monster=sim.enemies.as_ref().unwrap()[0];
+        let hp=sim.units[monster].d.hp;
+        sim.rng=Rng::new(17.0);
+        sim.q.add(120e9+1000.0,Ev::AutoAttack {source:0});
+        sim.process_next_event(&mut 0).unwrap();
+        assert_eq!(sim.units[monster].d.hp,hp);
+        assert_eq!(sim.rng.next(),Rng::new(17.0).next());
+        assert_eq!(sim.res.labyrinth_stats.failed_by_timeout,1);
+    }
+
+    #[test]
+    fn labyrinth_terminal_clears_old_events_and_resets_next_battle_at_absolute_time() {
+        let (gd,sc)=reset_fixture();
+        let mut sim=Sim::new(&gd,&sc,false).unwrap();
+        sim.on_combat_start().unwrap();
+        sim.time=37e9;
+        sim.units[0].d.hp=0.0;
+        sim.units[0].d.mp=0.0;
+        sim.units[0].out_of_mana=true;
+        sim.units[0].stunned=true;
+        sim.units[0].stun_expire=Some(100e9);
+        sim.units[0].blinded=true;
+        sim.units[0].silenced=true;
+        sim.fury(0,true,true);
+        sim.q.add(90e9,Ev::Dot {source_ref:1,target:0,damage:100.0,total:1.0,current:0.0});
+        sim.q.add(90e9,Ev::CastEnd {source:0,slot:0});
+        assert!(sim.check_encounter_end().unwrap());
+        assert_eq!(sim.q.len(),1);
+        assert!(matches!(sim.q.pop().unwrap().ev,Ev::CombatStart));
+        sim.on_combat_start().unwrap();
+        let p=&sim.units[0];
+        assert_eq!(p.d.hp,p.d.max_hp);
+        assert_eq!(p.d.mp,p.d.max_mp);
+        assert!(!p.out_of_mana && !p.stunned && !p.blinded && !p.silenced);
+        assert!(p.stun_expire.is_none() && p.blind_expire.is_none() && p.silence_expire.is_none());
+        assert!(p.combat_buffs.is_empty() && p.candidates.is_empty());
+        assert_eq!(p.next_cand,0);
+        assert_eq!(sim.units.len(),2);
+        assert_eq!(sim.lab.as_ref().unwrap().encounter_start,37e9);
+        assert_eq!(sim.enrage_begin,37e9);
+        assert!(sim.q.any(|e| matches!(e,Ev::RegenTick)));
+        assert!(!sim.q.any(|e| matches!(e,Ev::Dot {..}|Ev::CastEnd {..}|Ev::StunExp {..})));
+        let first=sim.q.pop().unwrap();
+        assert_eq!(first.time,js::round((37e9+sim.units[0].s[ATTACK_INTERVAL])/1e3)*1e3); // normal attack speed applies
+        sim.units[0].d.hp=0.0;
+        sim.time=43e9;
+        assert!(sim.check_encounter_end().unwrap());
+        assert_eq!(sim.res.labyrinth_stats.completed_trials,2);
+        assert_eq!(sim.q.len(),0,"must not schedule N+1");
+    }
+
+    #[test]
+    fn simultaneous_death_finishes_one_battle_with_success_priority() {
+        let (gd,mut sc)=reset_fixture();
+        sc["labyrinthTrials"]=json!(1);
+        let mut sim=Sim::new(&gd,&sc,false).unwrap();
+        sim.on_combat_start().unwrap();
+        let m=sim.enemies.as_ref().unwrap()[0];
+        sim.time=10e9;
+        sim.units[0].d.hp=0.0;
+        sim.units[m].d.hp=0.0;
+        sim.kill(0);sim.kill(m);
+        assert!(sim.check_encounter_end().unwrap());
+        let stats=&sim.res.labyrinth_stats;
+        assert_eq!((stats.completed_trials,stats.successes,stats.failed_by_death,stats.failed_by_timeout),(1,1,0,0));
+        assert_eq!(sim.res.deaths[&sim.units[0].hid],1.0);
+        assert_eq!(sim.q.len(),0);
+    }
+
+    #[test]
+    fn labyrinth_cooldowns_reset_without_rewinding_rng() {
+        let (gd,sc)=reset_fixture();
+        let mut sim=Sim::new(&gd,&sc,false).unwrap();
+        let def=Rc::new(AbilityDef {hrid:Rc::from("test"),hid:0,mana_cost:0.0,cooldown:20e9,
+            cast:1e9,is_special:false,effects:vec![],default_triggers:vec![]});
+        sim.units[0].abilities.push(Some(Ability {def:def.clone(),triggers:Rc::new(vec![]),last_used:99e9}));
+        sim.time=100e9;
+        sim.on_combat_start().unwrap();
+        assert_eq!(sim.units[0].abilities[0].as_ref().unwrap().last_used,MIN_SAFE_INTEGER);
+        assert!(matches!(sim.q.pop().unwrap().ev,Ev::CastEnd {..}));
+        let m=sim.enemies.as_ref().unwrap()[0];
+        sim.units[m].abilities.push(Some(Ability {def,triggers:Rc::new(vec![]),last_used:0.0}));
+        let before=sim.rng.next();
+        sim.units[m].reset(100e9,&mut sim.rng);
+        sim.units[m].fixed_labyrinth_cooldowns(100e9);
+        assert_eq!(sim.units[m].abilities.last().unwrap().as_ref().unwrap().last_used,90e9);
+        assert_ne!(sim.rng.next(),before);
+    }
 
     #[test]
     fn labyrinth_fury_misses_halve_effective_accuracy_and_damage() {

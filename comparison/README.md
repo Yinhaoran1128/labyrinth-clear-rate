@@ -67,6 +67,8 @@
 
 ## 开发和验证
 
+以下安装、测试和构建命令从 `labyrinth-clear-rate/` 目录开始执行；后续重放和 Rust 编译命令从 `comparison/` 目录开始执行。
+
 ```sh
 cd comparison
 npm ci
@@ -105,7 +107,7 @@ npm run build
 npm run test:browser
 ```
 
-当前 WASM 使用 Rust 1.99.0 构建。构建器会检查原脚本哈希，原文件改变后须重新审查兼容性。
+当前 WASM 使用 Rust 1.99.1 构建。构建器会检查原脚本哈希，原文件改变后须重新审查兼容性。
 `assets/mwi_engine.wasm` 是已编译的适配版；`engine/src/` 保存其源码。
 
 ## 来源说明
@@ -114,3 +116,7 @@ npm run test:browser
 JS 原战斗引擎来自 [shykai/MWICombatSimulatorTest](https://github.com/shykai/MWICombatSimulatorTest)。
 Rust 核心及三个 JS 适配模块来自 wow121/mwi-fastsim；本地 `engine/src/` 和 `vendor/fastsim-js/` 保留上游源码及说明，
 新工具只添加上述迷宫适配和对比界面。
+
+共享 Rust 引擎也提供 `labyrinthTrials` 场数模式（计算器自 1.7.0 起使用）。计算器 1.8.1 的自动推荐使用累计 300 → 1000 → 3000 场，按配置缓存样本，每批仅补缺额，详见[计算器说明](../calculator/README.md#战斗自动化等级推荐)。本独立对比工具仍显式使用 `simulationTimeLimit` 的旧时间模式，保留上述原版比较口径。WASM 主机提供可选 `env.labyrinth_progress` 导入，默认空回调；两种模式复用同一解析数据。局间 `out_of_mana` 清零修正仅在场数模式启用，避免改动对比基准。
+
+计算器 1.7.2 起，Rust 引擎的迷宫默认严格 120 秒截止。独立对比工具为保留固定 1.5.14 比较基准，在时间模式中显式传入 `labyrinthLegacyTimeout: true`；真实场数模式始终严格截止，不接受此旧超时选项。计算器没有该选项或模式选择 UI。

@@ -31,7 +31,7 @@ test('time recommendation uses closest unrounded fitted seconds, permits exceedi
     evaluate: async (level, budget) => timed(level, 100 + level * 3, budget * 2)});
   assert.equal(out.roomLevel, 68); // 304 seconds exactly; win rate is identical at every level.
   assert.equal(out.fittedSeconds, 304);
-  assert.equal(out.budget, 3000);
+  assert.equal(out.budget, 6000);
   assert.equal(out.recommendationChart.basis, 'seconds');
   assert.equal(out.recommendationChart.targetSeconds, 304);
   assert.ok(out.recommendationChart.observations.every(row => row.expectedSecondsPerClear > 0));
@@ -51,7 +51,7 @@ test('time search replaces misleading coarse results and retains infinite no-cle
       level === 100 && budget === 300 ? Infinity : level * 3, budget)});
   assert.equal(out.roomLevel, 100);
   assert.equal(out.fittedSeconds, 300);
-  assert.ok(out.recommendationChart.observations.some(row => row.expectedSecondsPerClear === Infinity));
+  assert.ok(out.recommendationChart.observations.every(row => row.isLatest));
   const none = await search({effectiveLevel: 2, targetSeconds: 300, minDelta: -2, maxDelta: 3,
     evaluate: async (level, budget) => timed(level, Infinity, budget)});
   assert.equal(none.fittedSeconds, Infinity);
@@ -162,7 +162,7 @@ test('handles zero and full target probabilities without out-of-range extrapolat
   assert.equal(full.roomLevel, 110);
   assert.equal(zero.roomLevel, 400);
 });
-test('returns every completed simulation round including replaced coarse samples for plotting', async () => {
+test('plots one cumulative result per level and uses actual cumulative counts as the budget', async () => {
   let calls = 0;
   const out = await search({effectiveLevel: 100, targetChance: .7,
     evaluate: async (level, budget) => {
@@ -171,14 +171,36 @@ test('returns every completed simulation round including replaced coarse samples
     }});
   assert.ok(out.recommendationChart, 'recommendation chart trace is missing');
   const trace = out.recommendationChart;
-  assert.equal(trace.observations.length, calls);
-  assert.deepEqual([...new Set(trace.observations.map(row => row.budget))].sort((a,b) => a-b), [300,1000,3000]);
+  assert.ok(trace.observations.length < calls);
+  assert.equal(trace.observations.length, trace.levelCount);
+  assert.ok(trace.observations.every(row => row.budget === row.trials));
   assert.equal(trace.targetChance, .7);
   assert.equal(trace.recommendedLevel, 150);
-  assert.deepEqual(trace.observations.filter(row => row.roomLevel === 150).map(row => row.budget), [300, 1000, 3000]);
+  assert.equal(trace.observations.filter(row => row.roomLevel === 150).length, 1);
   assert.equal(trace.observations.filter(row => row.isLatest).length, trace.curve.length);
   const final = trace.observations.find(row => row.roomLevel === 150 && row.isLatest);
   assert.equal(final.trials, 6000);
   assert.equal(final.confidenceInterval.confidenceLevel, .95);
   assert.ok(final.confidenceInterval.lower < .7 && final.confidenceInterval.upper > .7);
+});
+
+test('recommendation history retains completed-battle counts and duration statistics for later interval work',async()=>{
+  const out=await search({effectiveLevel:1,targetChance:.5,minDelta:0,maxDelta:0,
+    evaluate:async(level,n)=>{
+      const sample=observation(level,.5,n);
+      Object.assign(sample.result.combatMeta,{completedTrials:n,statisticalTrials:n,
+        failedByDeath:n/2,failedByTimeout:0,terminalDeaths:n/2,terminalTimeouts:0,
+        totalSpentSeconds:2*n,durationSquaredSeconds:4*n,successSpentSeconds:n,
+        durationMeanSeconds:2,durationM2SecondsSquared:0,durationSuccessComomentSeconds:0});
+      return sample;
+    }});
+  for(const row of out.recommendationChart.observations) {
+    assert.equal(row.completedTrials,row.budget);
+    assert.equal(row.trials,row.budget);
+    assert.equal(row.totalSpentSeconds,2*row.trials);
+    assert.equal(row.durationSquaredSeconds,4*row.trials);
+    assert.equal(row.successSpentSeconds,row.trials);
+    assert.equal(row.durationM2SecondsSquared,0);
+    assert.equal(row.durationSuccessComomentSeconds,0);
+  }
 });

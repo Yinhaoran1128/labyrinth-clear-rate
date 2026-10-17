@@ -5,6 +5,11 @@ use crate::{data, sim};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 
+#[link(wasm_import_module = "env")]
+extern "C" {
+    fn labyrinth_progress(completed: f64, target: f64);
+}
+
 thread_local! {
     static GD: RefCell<Option<&'static data::GameData>> = const { RefCell::new(None) };
     static OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -70,7 +75,9 @@ pub extern "C" fn run(ptr: *mut u8, len: usize, attacks: i32) -> i32 {
         let sc: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
         let limit = sc.get("simulationTimeLimit").map(data::to_num).unwrap_or(0.0);
         let mut s = sim::Sim::new(gd, &sc, attacks != 0)?;
-        s.simulate(limit)?;
+        s.simulate_with_progress(limit, |completed, target| unsafe {
+            labyrinth_progress(completed as f64, target as f64);
+        })?;
         Ok::<_, String>((s.result_json(), s.events_processed))
     })();
     set_out(match out {

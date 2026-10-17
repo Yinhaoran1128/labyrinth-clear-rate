@@ -26,12 +26,12 @@ const UPGRADE_TYPES = {
   experience:['wisdom','flatBoost'],
 };
 
-export function makeRustScenario(game, params) {
+export function makeRustScenario(game, params, {completedBattles = false} = {}) {
   const {level,trials,seed}=validateSettings({level:params.mazeDifficulty,trials:params.trials,seed:params.seed??0});
   const dto=structuredClone(params.playerDto);
   dto.food=[]; dto.drinks=[];
   const sc=compilePayload(game, {
-    combatMode:'labyrinth', players:[dto], seed, simulationTimeLimit:120*trials*1e9,
+    combatMode:'labyrinth', players:[dto], seed, simulationTimeLimit:completedBattles ? 0 : 120*trials*1e9,
     labyrinth:{labyrinthHrid:params.monsterHrid,roomLevel:level,crates:params.mazeCrateItemHrids||[]},
     extra:{},
   });
@@ -47,6 +47,13 @@ export function makeRustScenario(game, params) {
     }
     buff[field]+=n*.01;
   }
+  if (completedBattles) {
+    delete sc.simulationTimeLimit;
+    sc.labyrinthTrials=trials;
+  } else {
+    // Keep the standalone tool's pinned original-engine comparison unchanged.
+    sc.labyrinthLegacyTimeout=true;
+  }
   sc.labyrinthFixedMonsterCooldown=true;
   sc.labyrinthLegacyFury=true;
   return sc;
@@ -55,17 +62,21 @@ export function makeRustScenario(game, params) {
 export function summarizeResult(raw, timeBasis = 'last-success') {
   const stats=raw.labyrinthStats;
   const successes=stats?stats.successes:raw.successes;
-  // Original 1.5.14 counts actual player deaths even when thorns also kill the monster.
-  // Preserve that denominator instead of silently changing the comparison's statistics.
+  const completedBasis=timeBasis === 'completed';
+  // The calculator uses exclusive Rust terminal outcomes: simultaneous death is
+  // success only. The independent legacy comparison retains its reference convention.
   let failedByDeath=stats?stats.failedByDeath:(raw.failedByDeath||0);
-  if(stats && raw.deaths) {
+  if(stats && raw.deaths && !completedBasis) {
     const direct=Math.max(0,Math.floor(Number(raw.deaths.player1)||0));
     failedByDeath=direct>0?direct:Object.entries(raw.deaths).reduce((sum,[key,n])=>
       sum+(key.startsWith('player')?Math.max(0,Math.floor(Number(n)||0)):0),0);
   }
-  const failedByTimeout=stats?Math.max(0,stats.completedTrials-successes-failedByDeath):(raw.failedByTimeout||0);
-  const trials=stats?Math.max(1,successes+failedByDeath+failedByTimeout):raw.trials;
-  const completedSpentSeconds=stats?stats.completedSpentNs/1e9:null;
+  const failedByTimeout=stats?(completedBasis ? stats.failedByTimeout
+    : Math.max(0,stats.completedTrials-successes-failedByDeath)):(raw.failedByTimeout||0);
+  const statisticalTrials=stats?(completedBasis ? stats.completedTrials
+    : Math.max(1,successes+failedByDeath+failedByTimeout)):raw.trials;
+  const trials=timeBasis === 'completed' && stats ? stats.completedTrials : statisticalTrials;
+  const completedSpentSeconds=stats?(stats.totalSpentSeconds ?? stats.completedSpentNs/1e9):null;
   // Keep the original last-success clock for the comparison tool. Calculators
   // explicitly use completed time, including trailing failed encounters.
   const totalSpentSeconds=timeBasis === 'completed' ? completedSpentSeconds : stats
@@ -75,11 +86,21 @@ export function summarizeResult(raw, timeBasis = 'last-success') {
     throw new Error('缺少有效的已完成对局累计耗时');
   }
   return {
-    trials,successes,failures:Math.max(0,trials-successes),
+    trials,successes,failures:Math.max(0,statisticalTrials-successes),
     failedByDeath,failedByTimeout,completedTrials:stats?.completedTrials??null,
-    clearChance:trials>0?Math.max(0,Math.min(1,successes/trials)):0,
+    clearChance:trials>0?Math.max(0,Math.min(1,successes/statisticalTrials)):0,
     expectedSecondsPerClear:successes>0?totalSpentSeconds/successes:Infinity,
-    totalSpentSeconds,
+    totalSpentSeconds,statisticalTrials,
+    ...(stats ? {
+      // Mutually exclusive terminal classifications; legacy failedByDeath above
+      // can also count a player death during a successful simultaneous kill.
+      terminalDeaths:stats.failedByDeath,terminalTimeouts:stats.failedByTimeout,
+      durationSquaredSeconds:stats.durationSquaredSeconds,
+      successSpentSeconds:stats.successSpentSeconds,
+      durationMeanSeconds:stats.durationMeanSeconds,
+      durationM2SecondsSquared:stats.durationM2SecondsSquared,
+      durationSuccessComomentSeconds:stats.durationSuccessComomentSeconds,
+    } : {}),
     simulatedSeconds:raw.simulatedTime?raw.simulatedTime/1e9:(raw.firstRunDebug?.simulatedTime||0)/1e9,
     completeExpectedSecondsPerClear:completedSpentSeconds===null?null:(successes>0?completedSpentSeconds/successes:Infinity),
   };

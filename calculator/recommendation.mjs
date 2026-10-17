@@ -1,10 +1,10 @@
 import {createRecommendationChartData} from './chart-data.mjs';
 
-const SIMULATION_BUDGETS = [300, 1000, 3000];
+const BATTLE_COUNTS = [300, 1000, 3000];
 
 // Weighted pool-adjacent-violators (PAVA), constrained to decreasing win rates.
 // The weight uses the calculator's actual statistical denominator, not its
-// requested 120-second simulation budget. This is smoothing, not a confidence interval.
+// requested count. This is smoothing, not a confidence interval.
 export function fitDecreasingWinRates(samples) {
   const rows = samples.map(sample => ({...sample})).sort((a, b) => a.roomLevel - b.roomLevel);
   const blocks = [];
@@ -64,9 +64,8 @@ export function fitIncreasingClearSeconds(samples) {
   return rows;
 }
 
-// evaluate(roomLevel, budget) performs a complete continuous-battle run. A longer
-// run replaces its shorter predecessor; replayed/prefix observations are never
-// added together as if they were independent new battles.
+// evaluate(roomLevel, budget) ensures a cumulative sample count. The runtime
+// simulates only missing battles, using independent reproducible batch seeds.
 export async function findCombatRecommendation({effectiveLevel, targetChance, targetSeconds,
   minDelta = -300, maxDelta = 300, evaluate}) {
   const timeMode = targetSeconds !== undefined;
@@ -104,13 +103,26 @@ export async function findCombatRecommendation({effectiveLevel, targetChance, ta
     if (existing?.budget >= budget) return existing;
     const computed = await evaluate(roomLevel, budget);
     if (!computed) throw new Error('战斗推荐模拟未返回结果');
-    const sample = {...computed, roomLevel, levelDelta: roomLevel - baseLevel, budget};
+    const sample = {...computed, roomLevel, levelDelta: roomLevel - baseLevel,
+      budget: computed.result?.combatMeta?.trials};
     // Validate at the boundary, including zero/invalid actual sample counts.
     fitSamples([sample]);
     samples.set(roomLevel, sample);
-    history.push({id: history.length + 1, roomLevel, levelDelta: sample.levelDelta, budget,
+    history.push({id: history.length + 1, roomLevel, levelDelta: sample.levelDelta, budget: sample.budget,
       clearChance: sample.clearChance, trials: sample.result.combatMeta.trials,
+      statisticalTrials: sample.result.combatMeta.trials,
       successes: sample.result.combatMeta.successes,
+      completedTrials: sample.result.combatMeta.completedTrials ?? sample.result.combatMeta.trials,
+      failedByDeath: sample.result.combatMeta.failedByDeath,
+      failedByTimeout: sample.result.combatMeta.failedByTimeout,
+      terminalDeaths: sample.result.combatMeta.terminalDeaths,
+      terminalTimeouts: sample.result.combatMeta.terminalTimeouts,
+      totalSpentSeconds: sample.result.combatMeta.totalSpentSeconds,
+      durationSquaredSeconds: sample.result.combatMeta.durationSquaredSeconds,
+      successSpentSeconds: sample.result.combatMeta.successSpentSeconds,
+      durationMeanSeconds: sample.result.combatMeta.durationMeanSeconds,
+      durationM2SecondsSquared: sample.result.combatMeta.durationM2SecondsSquared,
+      durationSuccessComomentSeconds: sample.result.combatMeta.durationSuccessComomentSeconds,
       expectedSecondsPerClear: sample.result.expectedSecondsPerClear,
       seed: sample.result.combatMeta.firstRunDebug?.seed,
     });
@@ -145,9 +157,9 @@ export async function findCombatRecommendation({effectiveLevel, targetChance, ta
     }
   };
 
-  await sampleAt(baseLevel, SIMULATION_BUDGETS[0]);
-  await locateCrossing(SIMULATION_BUDGETS[0]);
-  for (const budget of SIMULATION_BUDGETS.slice(1)) {
+  await sampleAt(baseLevel, BATTLE_COUNTS[0]);
+  await locateCrossing(BATTLE_COUNTS[0]);
+  for (const budget of BATTLE_COUNTS.slice(1)) {
     // Refit and relocate after verification; a noisy coarse sample must not
     // permanently restrict the search to its original bracket.
     for (let round = 0; round < 4; round++) {
@@ -167,7 +179,7 @@ export async function findCombatRecommendation({effectiveLevel, targetChance, ta
   // Refitting can promote a previously coarse sample. Verify every promoted
   // finalist until the returned recommendation itself has the final budget.
   let best = nearest();
-  const finalBudget = SIMULATION_BUDGETS.at(-1);
+  const finalBudget = BATTLE_COUNTS.at(-1);
   while (best.budget < finalBudget) {
     await sampleAt(best.roomLevel, finalBudget);
     best = nearest();
